@@ -1,0 +1,1933 @@
+//go:build windows
+
+package appcore
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/wailsapp/wails/v2/pkg/runtime"
+
+	"clashmeta/core/clash"
+	"clashmeta/core/downloader"
+	"clashmeta/core/logger"
+	"clashmeta/core/runtimeassets"
+	"clashmeta/core/sys"
+	"clashmeta/core/tasks"
+	"clashmeta/core/utils"
+	"sync"
+	"time"
+
+	"golang.org/x/sync/singleflight"
+)
+
+var helperReadyGroup singleflight.Group
+
+type LogEntry = logger.LogEntry
+
+type AutoDelayRefreshOptions struct {
+	Immediate bool
+	Reason    string
+}
+
+type BootstrapOptions struct {
+	IsStartupLaunch bool
+	Silent          bool
+}
+
+type Options struct {
+	Events  EventSink
+	Version string
+
+	// OnStateChange 在每次 SyncState() 时回调，用于 App 层同步托盘等外部 UI
+	OnStateChange func()
+}
+
+// CoreRuntimeState 核心运行时状态
+type CoreRuntimeState struct {
+	Running      bool
+	PID          int
+	Owner        string // direct/helper
+	Purpose      string // user/delay/startup
+	Tun          bool
+	SystemProxy  bool
+	ActiveConfig string
+	Mode         string
+	StartedAt    time.Time
+}
+
+// runtimeStateStore 线程安全的核心运行时状态存储
+type runtimeStateStore struct {
+	mu    sync.RWMutex
+	state CoreRuntimeState
+}
+
+func (s *runtimeStateStore) Get() CoreRuntimeState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state
+}
+
+func (s *runtimeStateStore) Set(st CoreRuntimeState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state = st
+}
+
+func (s *runtimeStateStore) Clear() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state = CoreRuntimeState{}
+}
+
+// runtimeSatisfiesCore 检查当前运行时状态是否满足期望核心状态
+func (c *Controller) runtimeSatisfiesCore(plan RuntimePlan) bool {
+	if !clash.IsRunning() {
+		return false
+	}
+
+	st := c.runtimeState.Get()
+	if !st.Running {
+		return false
+	}
+	return st.Purpose == "user" &&
+		st.Tun == plan.NeedTun &&
+		st.ActiveConfig == plan.ActiveConfig &&
+		st.Mode == plan.Mode
+}
+
+type Controller struct {
+	events        EventSink
+	onStateChange func()
+	Behavior      *BehaviorStore
+	Offline       *OfflineNodeStore
+	Tasks         *tasks.Manager
+	version       string
+
+	Supervisor *CoreSupervisor
+	Desired    *DesiredStateStore
+	controls   *ControlCoordinator
+
+	mu                sync.RWMutex
+	coreLifecycleMu   sync.Mutex
+	componentUpdateMu sync.Mutex
+	sysProxyActive    bool
+	tunActive         bool
+
+	// 自动测速任务控制
+	autoTestQuit chan struct{}
+	autoTestMu   sync.Mutex
+
+	appLogger   *LogDispatcher
+	traffic     *TrafficStreamManager
+	logs        *LogStreamManager
+	Delay       *DelayTestManager
+	proxyState  *ProxyStateMonitor
+	connections *ConnectionMonitorManager
+	ctx         context.Context
+
+	updateReady   bool
+	newAppVersion string
+
+	downloadedUpdatePath    string
+	downloadedUpdateVersion string
+	pendingAppUpdateInfo    *downloader.AppUpdateInfo
+
+	GeoUpdates  *GeoUpdateManager
+	UpdateTasks *ComponentUpdateTaskStore
+
+	pendingCoreUpdateAssetURL string
+	pendingCoreUpdateVersion  string
+
+	// 🚀 核心：静默测速内核生命周期管理
+	delayCoreMu          sync.Mutex
+	delayCoreRefs        int
+	delayCoreStarted     bool
+	delayCoreStarting    bool
+	delayCoreReady       chan struct{}
+	delayCoreStartCancel context.CancelFunc
+	delayCoreStartErr    error
+	delayCoreStopTimer   *time.Timer
+
+	// 🚀 新增：明确用户运行意图
+	userCoreRunning bool
+	coreStartedAt   time.Time
+
+	// 核心运行时状态
+	runtimeState runtimeStateStore
+
+	// 🚀 核心：自适应调度状态
+	networkMu            sync.RWMutex
+	appUpdateDownloading bool
+	autoDelayRunning     bool
+}
+
+func (c *Controller) setAppUpdateDownloading(active bool) {
+	c.networkMu.Lock()
+	defer c.networkMu.Unlock()
+	c.appUpdateDownloading = active
+}
+
+func (c *Controller) isAppUpdateDownloading() bool {
+	c.networkMu.RLock()
+	defer c.networkMu.RUnlock()
+	return c.appUpdateDownloading
+}
+
+func (c *Controller) setAutoDelayRunning(active bool) {
+	c.networkMu.Lock()
+	defer c.networkMu.Unlock()
+	c.autoDelayRunning = active
+}
+
+func NewController(opts Options) *Controller {
+	behavior := NewBehaviorStore()
+	activeConfig := behavior.Get().ActiveConfig
+
+	c := &Controller{
+		events:        opts.Events,
+		onStateChange: opts.OnStateChange,
+		version:       opts.Version,
+		Behavior:      behavior,
+		Offline:       NewOfflineNodeStore(activeConfig),
+		Tasks:         tasks.NewManager(opts.Events),
+		Desired:       NewDesiredStateStore(),
+	}
+
+	// 🚀 核心修复：如果用户未开启“开机自启并恢复状态”，则在应用实例化时立即重置代理意图。
+	// 这保证了前端在第一时间拉取 GetAppState 时，拿到的是干净的 false 状态，
+	// 彻底杜绝每次启动页面都“先显示上次启动状态，然后才复位”的闪烁 Bug。
+	if !behavior.Get().RestoreOnStartup {
+		d := c.Desired.Get()
+		if d.SystemProxy || d.Tun || d.CoreRunning || d.PortProxy {
+			d.SystemProxy = false
+			d.Tun = false
+			d.CoreRunning = false
+			d.PortProxy = false
+			_ = c.Desired.SetAndSave(d)
+		}
+	}
+	c.appLogger = NewLogDispatcher(opts.Events, func() string {
+		return c.Behavior.Get().AppLogLevel
+	})
+	c.Supervisor = NewCoreSupervisor(c, c.Desired)
+	c.controls = NewControlCoordinator(c)
+	c.traffic = NewTrafficStreamManager(opts.Events, c.appLogger)
+	c.logs = NewLogStreamManager(c.appLogger)
+	c.Delay = NewDelayTestManager(opts.Events, c)
+	c.proxyState = NewProxyStateMonitor(opts.Events)
+	c.connections = NewConnectionMonitorManager(opts.Events)
+
+	c.UpdateTasks = NewComponentUpdateTaskStore(opts.Events)
+	c.GeoUpdates = NewGeoUpdateManager(opts.Events, c.updateGeoDatabase, c.UpdateTasks)
+
+	return c
+}
+
+func (c *Controller) logInfo(format string, args ...any) {
+	c.appLogger.AddApp(logger.LogEntry{
+		Type:    "info",
+		Payload: fmt.Sprintf(format, args...),
+	})
+}
+
+func (c *Controller) logWarn(format string, args ...any) {
+	c.appLogger.AddApp(logger.LogEntry{
+		Type:    "warn",
+		Payload: fmt.Sprintf(format, args...),
+	})
+}
+
+func (c *Controller) logError(format string, args ...any) {
+	c.appLogger.AddApp(logger.LogEntry{
+		Type:    "error",
+		Payload: fmt.Sprintf(format, args...),
+	})
+}
+
+func (c *Controller) LogApp(level string, format string, args ...any) {
+	if c == nil || c.appLogger == nil {
+		return
+	}
+
+	c.appLogger.AddApp(logger.LogEntry{
+		Type:    logger.NormalizeLevel(level),
+		Payload: fmt.Sprintf(format, args...),
+	})
+}
+
+func (c *Controller) CancelUpdateTask(key string) {
+	if isGeoKey(key) {
+		c.GeoUpdates.Cancel(key)
+	} else {
+		c.Tasks.Cancel(key)
+	}
+}
+
+func (c *Controller) RemoveUpdateTask(key string) {
+	c.CancelUpdateTask(key) // 总是先取消再移除
+	c.ClearUpdateCache(key) // 清理可能遗留的断点续传临时文件
+	c.UpdateTasks.Remove(key)
+}
+
+func (c *Controller) ClearUpdateCache(key string) {
+	var destPath string
+	switch key {
+	case "core-update":
+		destPath = filepath.Join(utils.GetCoreBinDir(), "clash.update.zip")
+	case "driver-install":
+		destPath = filepath.Join(utils.GetCoreBinDir(), "wintun.dll.zip")
+	default:
+		destPath, _ = clash.GeoDBPath(key)
+	}
+
+	if destPath != "" {
+		_ = os.Remove(destPath + ".tmp")
+		_ = os.Remove(destPath + ".tmp.meta.json")
+	}
+}
+
+func (c *Controller) Bootstrap(ctx context.Context, opts BootstrapOptions) {
+	c.ctx = ctx
+	CleanLegacyFiles(c.version)
+
+	clash.SetOnExitCallback(func(e clash.ExitEvent) {
+		if !e.Intentional {
+			c.mu.Lock()
+			wasCoreRunning := c.userCoreRunning
+			wasSysProxy := c.sysProxyActive
+			c.sysProxyActive = false
+			c.tunActive = false
+			c.userCoreRunning = false
+			c.coreStartedAt = time.Time{}
+			c.mu.Unlock()
+
+			if !wasCoreRunning {
+				// 如果在拉起过程（尚未设置为运行态）中遭遇临时挂掉，静默忽略，
+				// 交由 ensureCoreRunningWithDesiredState 内部的探活重试逻辑处理，避免 UI 假闪。
+				return
+			}
+
+			c.runtimeState.Clear()
+
+			if wasSysProxy {
+				if err := sys.DisableSystemProxy(); err != nil {
+					c.logWarn("内核异常退出后关闭系统代理失败: %v", err)
+				}
+			}
+
+			c.events.Emit("clash-exited", e.Message)
+			c.SyncState()
+			c.Supervisor.ReconcileAsync("core-exited")
+		}
+	})
+
+	c.syncStartupTaskStateSafe()
+
+	c.Supervisor.Start(ctx)
+
+	// 只有自启且配置了恢复状态时，才执行后台恢复任务（异步，带重试，不阻塞 UI）
+	if opts.IsStartupLaunch && c.Behavior.Get().RestoreOnStartup {
+		// 启动恢复：在后台完成后再启动 auto delay
+		go func() {
+			c.runStartupRestoreJob(ctx)
+			c.RefreshAutoDelayTest(AutoDelayRefreshOptions{
+				Immediate: true,
+				Reason:    "startup",
+			})
+		}()
+	} else {
+		// 普通双击启动，或者关闭了恢复状态的自启：清空期望状态
+		desired := c.Desired.Get()
+		desired.SystemProxy = false
+		desired.Tun = false
+		desired.CoreRunning = false
+		desired.PortProxy = false
+		c.Desired.SetAndSave(desired)
+
+		c.SyncState()
+
+		// 非启动恢复，立即启动 auto delay
+		c.RefreshAutoDelayTest(AutoDelayRefreshOptions{
+			Immediate: true,
+			Reason:    "startup",
+		})
+	}
+
+	c.RefreshAppAutoUpdate()
+}
+
+// runStartupRestoreJob 在后台异步恢复代理状态，带指数退避重试
+// 使用同步 Reconcile，结果驱动
+func (c *Controller) runStartupRestoreJob(ctx context.Context) {
+	backoff := []time.Duration{2 * time.Second, 5 * time.Second, 10 * time.Second, 20 * time.Second, 40 * time.Second}
+
+	for i, delay := range backoff {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+
+		desired := c.Desired.Get()
+		if !desired.CoreRunning && !desired.SystemProxy && !desired.Tun && !desired.PortProxy {
+			return
+		}
+
+		// 根据 desired 类型设置不同的 timeout
+		restoreTimeout := 8 * time.Second
+		if desired.Tun {
+			restoreTimeout = 15 * time.Second
+		}
+
+		attemptCtx, cancel := context.WithTimeout(ctx, restoreTimeout)
+		err := c.Supervisor.Reconcile(attemptCtx, "startup-restore")
+		cancel()
+
+		if err == nil {
+			c.logInfo("启动恢复成功 (attempt %d)", i+1)
+			return
+		}
+
+		switch {
+		case errors.Is(err, ErrNoActiveConfig):
+			c.notify("error", "STARTUP_RESTORE_NO_CONFIG", "启动恢复失败：尚未添加配置", "startup")
+			return
+		case errors.Is(err, ErrHelperInstallRequired):
+			c.notify("error", "STARTUP_RESTORE_HELPER_REQUIRED", "TUN 启动恢复需要初始化后台服务", "startup")
+			return
+		case errors.Is(err, ErrWintunMissing):
+			c.notify("error", "STARTUP_RESTORE_WINTUN_MISSING", "TUN 启动恢复失败：缺少 Wintun 驱动", "startup")
+			return
+		default:
+			c.logWarn("启动恢复失败 attempt=%d: %v", i+1, err)
+		}
+	}
+
+	c.logWarn("启动恢复在 5 次尝试后仍未成功")
+}
+
+func (c *Controller) syncStartupTaskStateSafe() {
+	info, err := sys.CheckStartupTask()
+	if err != nil {
+		c.events.Emit("startup-task-check-warning", err.Error())
+		return
+	}
+
+	behavior := c.Behavior.Get()
+
+	// ① 任务根本不存在 → 确实需要同步为 false
+	if !info.Exists {
+		if behavior.StartupWithOS {
+			behavior.StartupWithOS = false
+			_ = c.Behavior.SetAndSave(behavior)
+		}
+		return
+	}
+
+	// ② 任务存在，但用户在任务计划器里手动关掉了
+	//    （SchedulerEnabled=false 且无错误，说明是用户主动禁用而非健康检查失败）
+	if !info.SchedulerEnabled && info.LastError == "" {
+		if behavior.StartupWithOS {
+			behavior.StartupWithOS = false
+			_ = c.Behavior.SetAndSave(behavior)
+		}
+		return
+	}
+
+	// ③ 任务存在且 SchedulerEnabled=true，但健康检查失败
+	//    （路径/参数不匹配、旧管理员任务等）
+	//    → 不覆盖用户配置，仅通过事件通知前端需要修复
+	if !info.IsHealthy {
+		c.events.Emit("startup-task-unhealthy", info.LastError)
+		return
+	}
+
+	// ④ 任务存在且健康 → 双向同步（防止外部改动漏同步）
+	if behavior.StartupWithOS != info.SchedulerEnabled {
+		behavior.StartupWithOS = info.SchedulerEnabled
+		_ = c.Behavior.SetAndSave(behavior)
+	}
+}
+
+func (c *Controller) GetEvents() EventSink {
+	return c.events
+}
+
+// AppState 定义全局状态同步结构
+type AppState struct {
+	IsRunning   bool   `json:"isRunning"`
+	IsAdmin     bool   `json:"isAdmin"`
+	Mode        string `json:"mode"`
+	Theme       string `json:"theme"`
+	HideLogs    bool   `json:"hideLogs"`
+	LogLevel    string `json:"logLevel"`
+	AppLogLevel string `json:"appLogLevel"`
+	// 用户意图（卡片数据源）
+	DesiredSystemProxy bool `json:"desiredSystemProxy"`
+	DesiredTun         bool `json:"desiredTun"`
+	DesiredPortProxy   bool `json:"desiredPortProxy"`
+	// 后端实际 runtime 状态（诊断/IP 检测用）
+	ActualSystemProxy bool   `json:"actualSystemProxy"`
+	ActualTun         bool   `json:"actualTun"`
+	ControlRevision   uint64 `json:"controlRevision"`
+	// 兼容旧前端
+	SystemProxy bool   `json:"systemProxy"`
+	Tun         bool   `json:"tun"`
+	Version     string `json:"version"`
+	AppVersion  string `json:"appVersion"`
+	// 让前端实时知道当前在跑哪个配置
+	ActiveConfig     string `json:"activeConfig"`
+	ActiveConfigName string `json:"activeConfigName"`
+	ActiveConfigType string `json:"activeConfigType"`
+	// 延迟保留相关
+	DelayRetention     bool   `json:"delayRetention"`
+	DelayRetentionTime string `json:"delayRetentionTime"`
+
+	// 应用更新相关
+	UpdateReady      bool   `json:"updateReady"`
+	NewAppVersion    string `json:"newAppVersion"`
+	UpdateDownloaded bool   `json:"updateDownloaded"`
+	DownloadedPath   string `json:"downloadedPath"`
+
+	// 仅端口代理模式（从 behavior 读取，传给前端以驱动按钮文字和行为）
+	PortProxyMode bool `json:"portProxyMode"`
+}
+
+// GetAppState 获取应用运行状态快照
+func (c *Controller) GetAppState() AppState {
+	behavior := c.Behavior.Get()
+	activeConfig := behavior.ActiveConfig
+	desired := c.Desired.Get()
+
+	c.mu.RLock()
+	sysProxy := c.sysProxyActive
+	tunActive := c.tunActive
+	userRunning := c.userCoreRunning
+	c.mu.RUnlock()
+
+	// 将内核物理运行状态与 UI 业务接管状态解耦
+	logicalIsRunning := clash.IsRunning() && userRunning
+
+	state := AppState{
+		IsRunning:          logicalIsRunning,
+		IsAdmin:            sys.CheckAdmin(),
+		Mode:               behavior.ActiveMode,
+		DesiredSystemProxy: desired.SystemProxy,
+		DesiredTun:         desired.Tun,
+		DesiredPortProxy:   desired.PortProxy,
+		ActualSystemProxy:  sysProxy,
+		ActualTun:          tunActive,
+		SystemProxy:        sysProxy,
+		Tun:                tunActive,
+		Theme:              utils.GetGlobalTheme(),
+		Version:            clash.GetLocalCoreVersion(c.ctx),
+		AppVersion:         c.version,
+		ActiveConfig:       activeConfig,
+		DelayRetention:     behavior.DelayRetention,
+		DelayRetentionTime: behavior.DelayRetentionTime,
+		HideLogs:           behavior.HideLogs,
+		LogLevel:           behavior.LogLevel,
+		AppLogLevel:        behavior.AppLogLevel,
+		UpdateReady:        c.updateReady,
+		NewAppVersion:      c.newAppVersion,
+		UpdateDownloaded:   c.downloadedUpdatePath != "",
+		DownloadedPath:     c.downloadedUpdatePath,
+		PortProxyMode:      behavior.PortProxyMode,
+	}
+	if c.controls != nil {
+		state.ControlRevision = c.controls.Revision()
+	}
+
+	if activeConfig != "" {
+		state.ActiveConfigName = activeConfig
+		if item, ok := clash.FindSubIndexByID(activeConfig); ok {
+			state.ActiveConfigName = item.Name
+			state.ActiveConfigType = item.Type
+		}
+	}
+
+	return state
+}
+
+// SyncState 触发状态同步事件
+func (c *Controller) SyncState() {
+	state := c.GetAppState()
+	c.events.Emit("app-state-sync", state)
+
+	if c.onStateChange != nil {
+		c.onStateChange()
+	}
+
+	// 🚀 核心修复：Controller 自助管理流量流
+	if c.ctx != nil {
+		if state.IsRunning {
+			behavior := c.Behavior.Get()
+			c.traffic.Start(c.ctx, clash.APIURL("/traffic?interval=900"), behavior.ProxyTrafficOnly)
+			c.proxyState.Start(c.ctx)
+		} else {
+			c.traffic.Stop()
+			c.proxyState.Stop()
+		}
+	}
+}
+
+// --- 内部方法 (需要提前持有 coreLifecycleMu) ---
+
+func (c *Controller) ensureCoreRunningWithDesiredState(ctx context.Context, desired DesiredState) error {
+	// 检查当前运行时状态是否已满足期望
+	if c.runtimeSatisfiesCore(RuntimePlan{
+		NeedTun:      desired.Tun,
+		ActiveConfig: desired.ActiveConfig,
+		Mode:         desired.Mode,
+	}) {
+		return nil
+	}
+
+	// 启动核心前强制兜底：从 seed 修补缺失/损坏的 core/wintun（在 activeConfig 检查之前）
+	assetReq := runtimeassets.RequireCoreOnly
+	if desired.Tun {
+		assetReq = runtimeassets.RequireTun
+	}
+	if assetStatus, assetErr := runtimeassets.EnsureReady(ctx, assetReq, runtimeassets.RepairInvalid); assetErr != nil {
+		for _, asset := range assetStatus.Assets {
+			if !asset.Ready && asset.Error != "" {
+				c.logWarn("运行组件不可用: %s path=%s error=%s", asset.Key, asset.Path, asset.Error)
+			}
+		}
+		return fmt.Errorf("运行组件不可用: %w", assetErr)
+	}
+
+	if desired.ActiveConfig == "" {
+		return ErrNoActiveConfig
+	}
+
+	// TUN 模式：确保 helper 服务就绪
+	if desired.Tun {
+		if err := c.EnsureHelperReady("tun-start"); err != nil {
+			return err
+		}
+	}
+
+	behavior := c.Behavior.Get()
+
+	err := clash.BuildRuntimeConfig(desired.ActiveConfig, desired.Mode, behavior.LogLevel, desired.Tun)
+	if err != nil {
+		return err
+	}
+
+	if err := EnsureRuntimeAssets(ctx, behavior); err != nil {
+		c.logWarn("确保运行期资产失败: %v", err)
+	}
+
+	if err := clash.Start(ctx, desired.Tun); err != nil {
+		return err
+	}
+
+	apiReady := false
+	var lastProbeErr error
+	for i := 0; i < 100; i++ {
+		select {
+		case <-ctx.Done():
+			clash.Stop()
+			c.mu.Lock()
+			c.userCoreRunning = false
+			c.coreStartedAt = time.Time{}
+			c.mu.Unlock()
+			return ctx.Err()
+		default:
+		}
+
+		if !clash.IsRunning() {
+			// 如果在探活期间内核进程挂掉（如遭遇残存的 TIME_WAIT 端口冲突），
+			// 避免原地等待 10 秒，而是等待缓冲后自动原地重试拉起。
+			clash.Stop()
+			if i < 90 {
+				time.Sleep(150 * time.Millisecond)
+				if err := clash.Start(ctx, desired.Tun); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+
+		if err := clash.PingAPIWithContext(ctx); err == nil {
+			apiReady = true
+			break
+		} else {
+			lastProbeErr = err
+		}
+
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			clash.Stop()
+			c.mu.Lock()
+			c.userCoreRunning = false
+			c.coreStartedAt = time.Time{}
+			c.mu.Unlock()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+
+	if !apiReady {
+		clash.Stop()
+		c.mu.Lock()
+		c.userCoreRunning = false
+		c.coreStartedAt = time.Time{}
+		c.mu.Unlock()
+		return fmt.Errorf("内核启动失败: %s", classifyProbeError(lastProbeErr))
+	}
+
+	c.mu.Lock()
+	c.userCoreRunning = true
+	c.tunActive = desired.Tun
+	c.coreStartedAt = time.Now()
+	c.mu.Unlock()
+
+	// 设置运行时状态
+	owner := "direct"
+	if desired.Tun {
+		owner = "helper"
+	}
+	c.runtimeState.Set(CoreRuntimeState{
+		Running:      true,
+		Owner:        owner,
+		Purpose:      "user",
+		Tun:          desired.Tun,
+		SystemProxy:  c.sysProxyActive,
+		ActiveConfig: desired.ActiveConfig,
+		Mode:         desired.Mode,
+		StartedAt:    time.Now(),
+	})
+
+	// 内核已有反应，同步状态
+	c.SyncState()
+
+	// 完整代理数据后台处理，不阻塞开关返回
+	go func() {
+		bgCtx, cancel := context.WithTimeout(c.ctx, 8*time.Second)
+		defer cancel()
+		c.applyStoredProxySelections(bgCtx, desired.ActiveConfig)
+		c.SyncProxyStateOnce()
+	}()
+
+	return nil
+}
+
+func (c *Controller) stopCoreProcessLocked() {
+	clash.Stop()
+	c.mu.Lock()
+	c.userCoreRunning = false
+	// TUN routing ceases the moment the core stops, even though the Wintun
+	// adapter may linger in the Windows network stack for a few seconds.
+	// Clearing tunActive here avoids emitting a stale actualTun=true snapshot
+	// during restart/shutdown, which would mislead the frontend into showing
+	// "启动中..." when TUN is actually winding down.
+	c.tunActive = false
+	c.coreStartedAt = time.Time{}
+	c.mu.Unlock()
+	c.runtimeState.Clear()
+}
+
+// classifyProbeError 将探针错误分类为用户可读的诊断信息
+func classifyProbeError(err error) string {
+	if err == nil {
+		return "API 未能在预期时间内就绪"
+	}
+
+	msg := err.Error()
+
+	// 端口未监听：内核未绑定 API 端口
+	if strings.Contains(msg, "connection refused") {
+		return "端口未监听，内核未绑定 API 端口"
+	}
+
+	// 超时
+	if strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded") {
+		return "内核响应超时，可能配置文件过大或系统资源不足"
+	}
+
+	// HTTP 状态码非 2xx
+	if strings.Contains(msg, "failed: HTTP") || strings.Contains(msg, "HTTP ") {
+		return "端口被其他程序占用，收到非预期响应"
+	}
+
+	// 响应非合法 JSON
+	if strings.Contains(msg, "unexpected end") || strings.Contains(msg, "invalid character") ||
+		strings.Contains(msg, "cannot decode") || strings.Contains(msg, "JSON") {
+		return "端口被其他程序占用，响应内容非内核格式"
+	}
+
+	// 连接重置 / 连接断开
+	if strings.Contains(msg, "connection reset") || strings.Contains(msg, "broken pipe") {
+		return "连接被重置，内核可能已崩溃"
+	}
+
+	// 其他 net.OpError
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return "网络连接异常"
+	}
+
+	return "API 探针异常，请检查内核配置"
+}
+
+// --- 导出方法 ---
+
+// EnsureCoreRunning 确保内核已启动并就绪 (带锁包装)
+func (c *Controller) EnsureCoreRunning(ctx context.Context) error {
+	c.coreLifecycleMu.Lock()
+	defer c.coreLifecycleMu.Unlock()
+
+	desired := c.Desired.Get()
+	if desired.ActiveConfig == "" {
+		behavior := c.Behavior.Get()
+		desired.ActiveConfig = behavior.ActiveConfig
+		desired.Mode = behavior.ActiveMode
+	}
+	return c.ensureCoreRunningWithDesiredState(ctx, desired)
+}
+
+// StopCoreService 停止内核并清理所有运行时状态（通常用于程序退出）
+func (c *Controller) StopCoreService() {
+	c.DisableAll()
+}
+
+func (c *Controller) reconcileCoreProcess(ctx context.Context, plan RuntimePlan) error {
+	if c.runtimeSatisfiesCore(plan) {
+		return nil
+	}
+
+	if plan.RestartRequired {
+		if err := c.RestartCoreWithReason(ctx, plan.Reason); err != nil {
+			return fmt.Errorf("restart core failed: %w", err)
+		}
+	} else {
+		if err := c.EnsureCoreRunning(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Controller) reconcileSystemProxy(plan RuntimePlan) error {
+	if plan.NeedSysProxy {
+		return c.ensureSystemProxyEnabled()
+	}
+	return c.ensureSystemProxyDisabled()
+}
+
+func (c *Controller) ensureSystemProxyEnabled() error {
+	port := clash.GetProxyPort()
+	current, err := sys.GetSystemProxyState()
+	// Windows 10/11 有时将注册表代理写成 "http=127.0.0.1:7890;https=..." 格式，
+	// 严格相等会误判失效；用 Contains 兼容两种格式。
+	expectedAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	if err == nil && current.Enabled && strings.Contains(current.Server, expectedAddr) {
+		c.mu.Lock()
+		c.sysProxyActive = true
+		c.mu.Unlock()
+		return nil
+	}
+
+	err = sys.EnableSystemProxy(
+		"127.0.0.1",
+		port,
+		"localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;<local>",
+	)
+	if err != nil {
+		c.setLastError("设置 Windows 系统代理失败: " + err.Error())
+		c.mu.Lock()
+		c.sysProxyActive = false
+		c.mu.Unlock()
+		return err
+	}
+	c.mu.Lock()
+	c.sysProxyActive = true
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *Controller) ensureSystemProxyDisabled() error {
+	current, err := sys.GetSystemProxyState()
+	if err != nil {
+		return fmt.Errorf("读取 Windows 系统代理状态失败: %w", err)
+	}
+
+	if current.Enabled {
+		if err := sys.DisableSystemProxy(); err != nil {
+			return fmt.Errorf("关闭 Windows 系统代理失败: %w", err)
+		}
+	}
+
+	c.mu.Lock()
+	c.sysProxyActive = false
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *Controller) setRuntimeStateFromPlan(plan RuntimePlan) {
+	c.mu.Lock()
+	c.tunActive = plan.NeedTun
+	c.userCoreRunning = plan.NeedCore
+	c.mu.Unlock()
+}
+
+func (c *Controller) setLastError(msg string) {
+	c.notify("error", "RUNTIME_OPERATION_FAILED", msg, "appcore")
+}
+
+func (c *Controller) notify(level, code, message, source string) {
+	c.events.Emit(EventNotification, Notification{
+		Level:   level,
+		Code:    code,
+		Message: message,
+		Source:  source,
+	})
+	if level == "error" {
+		c.events.Emit(EventNotifyError, message)
+	}
+}
+
+// DisableAll 彻底清理并关闭所有功能
+func (c *Controller) DisableAll() {
+	c.coreLifecycleMu.Lock()
+	defer c.coreLifecycleMu.Unlock()
+
+	c.stopCoreProcessLocked()
+	_ = sys.DisableSystemProxy()
+
+	c.mu.Lock()
+	c.sysProxyActive = false
+	c.tunActive = false
+	c.userCoreRunning = false
+	c.coreStartedAt = time.Time{}
+	c.mu.Unlock()
+
+	shouldStopDelayCore := false
+	var cancelStart context.CancelFunc
+	var ready chan struct{}
+
+	c.delayCoreMu.Lock()
+	if c.delayCoreStarted || c.delayCoreStarting {
+		shouldStopDelayCore = true
+	}
+
+	cancelStart = c.delayCoreStartCancel
+	ready = c.delayCoreReady
+
+	c.delayCoreRefs = 0
+	c.delayCoreStarted = false
+	c.delayCoreStarting = false
+	c.delayCoreStartErr = fmt.Errorf("测速已取消")
+	c.delayCoreStartCancel = nil
+	c.delayCoreReady = nil
+
+	if c.delayCoreStopTimer != nil {
+		c.delayCoreStopTimer.Stop()
+		c.delayCoreStopTimer = nil
+	}
+	c.delayCoreMu.Unlock()
+
+	if cancelStart != nil {
+		cancelStart()
+	}
+
+	if ready != nil {
+		close(ready)
+	}
+
+	if shouldStopDelayCore {
+		clash.Stop()
+	}
+
+	c.SyncState()
+}
+
+// 🚀 核心新增：静默测速内核保障机制
+// 返回值：cleanup 释放引用, warmupRequired 是否处于启动预热窗口, err 错误
+func (c *Controller) EnsureDelayCore(ctx context.Context) (cleanup func(), warmupRequired bool, err error) {
+	c.delayCoreMu.Lock()
+
+	// 如果有待执行的 idle 停止 timer，先取消
+	if c.delayCoreStopTimer != nil {
+		c.delayCoreStopTimer.Stop()
+		c.delayCoreStopTimer = nil
+	}
+
+	// 情况 1：内核已在物理运行
+	if clash.IsRunning() {
+		c.delayCoreRefs++
+		c.delayCoreMu.Unlock()
+		warmup := c.NeedsDelayWarmup()
+		return c.releaseDelayCore, warmup, nil
+	}
+
+	// 情况 2：已有其他协程正在启动内核，挂载并等待
+	if c.delayCoreStarting {
+		ready := c.delayCoreReady
+		c.delayCoreMu.Unlock()
+
+		select {
+		case <-ready:
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		}
+
+		c.delayCoreMu.Lock()
+		defer c.delayCoreMu.Unlock()
+
+		if c.delayCoreStartErr != nil {
+			return nil, false, c.delayCoreStartErr
+		}
+
+		if !clash.IsRunning() {
+			return nil, false, fmt.Errorf("测速内核启动失败")
+		}
+
+		c.delayCoreRefs++
+		return c.releaseDelayCore, true, nil
+	}
+
+	// 情况 3：内核未运行，且本协程是第一个发起启动的
+	profileID := c.Behavior.Get().ActiveConfig
+	if profileID == "" {
+		c.delayCoreMu.Unlock()
+		return nil, false, fmt.Errorf("请先在订阅管理中选择并应用一个配置文件")
+	}
+
+	startCtx, cancel := context.WithCancel(ctx)
+
+	c.delayCoreStarting = true
+	c.delayCoreReady = make(chan struct{})
+	c.delayCoreStartCancel = cancel
+	ready := c.delayCoreReady
+	c.delayCoreStartErr = nil
+	c.delayCoreMu.Unlock()
+
+	// 在锁外执行耗时的启动与探测
+	startErr := c.startDelayCoreAndWaitReady(startCtx, profileID)
+
+	ok := c.finishDelayCoreStart(ready, startErr)
+	if !ok {
+		// 如果启动被 DisableAll 抢先取消了
+		if startErr == nil && !c.IsUserRunning() {
+			clash.Stop()
+			c.SyncState()
+		}
+		return nil, false, fmt.Errorf("测速已取消")
+	}
+
+	if startErr != nil {
+		return nil, false, startErr
+	}
+
+	c.delayCoreMu.Lock()
+	c.delayCoreStarted = true
+	c.delayCoreRefs = 1
+	c.delayCoreMu.Unlock()
+
+	c.mu.Lock()
+	c.coreStartedAt = time.Now()
+	c.mu.Unlock()
+
+	return c.releaseDelayCore, true, nil
+}
+
+func (c *Controller) finishDelayCoreStart(ready chan struct{}, err error) bool {
+	c.delayCoreMu.Lock()
+	defer c.delayCoreMu.Unlock()
+
+	if c.delayCoreReady != ready {
+		return false
+	}
+
+	c.delayCoreStarting = false
+	c.delayCoreStartErr = err
+	c.delayCoreStartCancel = nil
+	close(ready)
+	c.delayCoreReady = nil
+
+	return true
+}
+
+func (c *Controller) startDelayCoreAndWaitReady(ctx context.Context, profileID string) error {
+	started := false
+	ready := false
+
+	if err := c.StartCoreOnly(ctx, profileID); err != nil {
+		return fmt.Errorf("启动测速内核失败: %w", err)
+	}
+	started = true
+
+	// 🛡️ 核心保障：如果启动失败或中途取消，必须停止这个临时 core
+	defer func() {
+		if started && !ready && !c.IsUserRunning() {
+			clash.Stop()
+			c.SyncState()
+		}
+	}()
+
+	ticker := time.NewTicker(150 * time.Millisecond)
+	defer ticker.Stop()
+
+	timeout := time.NewTimer(10 * time.Second)
+	defer timeout.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+
+		case <-timeout.C:
+			return fmt.Errorf("测速内核启动超时")
+
+		case <-ticker.C:
+			if _, err := clash.GetInitialData(); err == nil {
+				ready = true
+				return nil
+			}
+		}
+	}
+}
+
+const DelayCoreIdleTTL = 15 * time.Second
+
+func (c *Controller) releaseDelayCore() {
+	c.delayCoreMu.Lock()
+
+	if c.delayCoreRefs > 0 {
+		c.delayCoreRefs--
+	}
+
+	shouldScheduleStop := false
+	if c.delayCoreRefs == 0 && c.delayCoreStarted && !c.IsUserRunning() {
+		shouldScheduleStop = true
+	}
+
+	if shouldScheduleStop {
+		if c.delayCoreStopTimer != nil {
+			c.delayCoreStopTimer.Stop()
+		}
+
+		c.delayCoreStopTimer = time.AfterFunc(DelayCoreIdleTTL, func() {
+			c.delayCoreMu.Lock()
+
+			if c.delayCoreRefs > 0 || !c.delayCoreStarted || c.IsUserRunning() {
+				c.delayCoreMu.Unlock()
+				return
+			}
+
+			c.delayCoreStarted = false
+			c.delayCoreStopTimer = nil
+			c.delayCoreMu.Unlock()
+
+			c.mu.Lock()
+			c.coreStartedAt = time.Time{}
+			c.mu.Unlock()
+
+			clash.Stop()
+			c.SyncState()
+		})
+	}
+
+	c.delayCoreMu.Unlock()
+}
+
+func (c *Controller) IsUserRunning() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.userCoreRunning
+}
+
+const DelayWarmupWindow = 20 * time.Second
+
+func (c *Controller) NeedsDelayWarmup() bool {
+	c.mu.RLock()
+	startedAt := c.coreStartedAt
+	c.mu.RUnlock()
+
+	if startedAt.IsZero() {
+		return false
+	}
+
+	return time.Since(startedAt) <= DelayWarmupWindow
+}
+
+// StartCoreOnly 严格执行“只启内核，不改状态”
+func (c *Controller) StartCoreOnly(ctx context.Context, id string) error {
+	behavior := c.Behavior.Get()
+	// 仅构建运行时 YAML 并启动进程，强制禁用 TUN 以避免影响真实代理状态
+	if err := clash.BuildRuntimeConfig(id, behavior.ActiveMode, behavior.LogLevel, false); err != nil {
+		return err
+	}
+	return clash.Start(ctx, false) // delay 测试不走 TUN
+}
+
+// StopCoreProcess 仅停止物理进程，保留用户开启意图
+func (c *Controller) StopCoreProcess() {
+	c.coreLifecycleMu.Lock()
+	defer c.coreLifecycleMu.Unlock()
+	c.stopCoreProcessLocked()
+}
+
+func (c *Controller) fillDesiredTarget(d *DesiredState) {
+	b := c.Behavior.Get()
+	d.ActiveConfig = b.ActiveConfig
+	d.Mode = b.ActiveMode
+}
+
+// ToggleSystemProxy 开关：系统代理
+func (c *Controller) ToggleSystemProxy(ctx context.Context, enable bool) error {
+	return c.controls.SetSystemProxy(ctx, enable)
+}
+
+// ToggleSystemProxyFromCurrentDesired is used by the tray so the target is
+// calculated under the same lock that commits the command.
+func (c *Controller) ToggleSystemProxyFromCurrentDesired(ctx context.Context) error {
+	return c.controls.ToggleSystemProxy(ctx)
+}
+
+// EnsureHelperReady 确保 helper 服务已安装并运行
+// 使用 singleflight 合并并发调用
+func (c *Controller) EnsureHelperReady(reason string) error {
+	_, err, _ := helperReadyGroup.Do("helper-ready", func() (any, error) {
+		return nil, c.ensureHelperReadySlow(reason)
+	})
+	return err
+}
+
+func (c *Controller) ensureHelperReadySlow(reason string) error {
+	client := sys.NewHelperClient()
+
+	if err := client.Ping(); err == nil {
+		// Helper already reachable — register this process so the watchdog
+		// can detect a future abnormal exit.
+		_ = client.RegisterParent(os.Getpid())
+		return nil
+	}
+
+	if !sys.CheckAdmin() {
+		helperStatus := sys.CheckHelperService()
+		if !helperStatus.Installed {
+			return ErrHelperInstallRequired
+		}
+		return ErrHelperRepairRequired
+	}
+
+	helperExe := filepath.Join(utils.GetAppDir(), "ClashMetaHelper.exe")
+	sid, err := sys.CurrentUserSID()
+	if err != nil {
+		return fmt.Errorf("获取当前用户 SID 失败: %w", err)
+	}
+
+	if err := sys.RecoverHelperServiceForUser(helperExe, sid); err != nil {
+		return fmt.Errorf("修复后台服务失败: %w", err)
+	}
+
+	// Register after successful recovery so the watchdog starts immediately.
+	_ = client.RegisterParent(os.Getpid())
+	c.logInfo("Helper 服务已自愈并就绪 (reason: %s)", reason)
+	return nil
+}
+
+// ToggleTunMode 开关：TUN 模式
+func (c *Controller) ToggleTunMode(ctx context.Context, enable bool) error {
+	return c.controls.SetTun(ctx, enable)
+}
+
+// prepareTunEnable contains the prerequisites shared by every TUN entry
+// point. It intentionally runs inside ControlCoordinator serialization so a
+// tray command cannot bypass validation or race a concurrent control change.
+func (c *Controller) prepareTunEnable(ctx context.Context) error {
+	behavior := c.Behavior.Get()
+	if behavior.ActiveConfig == "" {
+		return ErrNoActiveConfig
+	}
+
+	client := sys.NewHelperClient()
+	helperReachable := client.Ping() == nil
+	if !helperReachable && !sys.CheckAdmin() {
+		helperStatus := sys.CheckHelperService()
+		if !helperStatus.Installed {
+			return ErrHelperInstallRequired
+		}
+		return ErrHelperRepairRequired
+	}
+
+	if !helperReachable && sys.CheckAdmin() {
+		if err := c.EnsureHelperReady("tun-first-install"); err != nil {
+			return fmt.Errorf("安装后台服务失败: %w", err)
+		}
+	}
+
+	if helperReachable {
+		// Refresh the watchdog registration so helper always tracks the live PID.
+		_ = client.RegisterParent(os.Getpid())
+	}
+
+	assetStatus, assetErr := runtimeassets.EnsureReady(ctx, runtimeassets.RequireTun, runtimeassets.RepairInvalid)
+	if assetErr != nil {
+		w := assetStatus.Assets[runtimeassets.AssetWintun]
+		if !w.Ready {
+			return fmt.Errorf("缺少 Wintun 依赖: %s (%s)", w.Error, w.Path)
+		}
+		return assetErr
+	}
+
+	return nil
+}
+
+// ToggleTunFromCurrentDesired is the TUN equivalent of the tray-safe toggle.
+func (c *Controller) ToggleTunFromCurrentDesired(ctx context.Context) error {
+	return c.controls.ToggleTun(ctx)
+}
+
+// RestartCore 重启内核（默认为内部调用原因）
+func (c *Controller) RestartCore(ctx context.Context) error {
+	return c.RestartCoreWithReason(ctx, "internal")
+}
+
+// RestartCoreWithReason 重启内核并携带显式原因，决定是否触发缓存清理
+func (c *Controller) RestartCoreWithReason(ctx context.Context, reason string) error {
+	if err := c.guardDisruptiveAction(reason); err != nil {
+		c.queuePendingDisruptiveAction(reason)
+		return err
+	}
+
+	c.coreLifecycleMu.Lock()
+	defer c.coreLifecycleMu.Unlock()
+
+	wasRunning := clash.IsRunning()
+	c.stopCoreProcessLocked()
+
+	if wasRunning {
+		// 留出 250ms 缓冲期，确保 Windows 操作系统完成对旧内核 9090 和 7890 端口的 TCP TIME_WAIT 状态回收，
+		// 避免新内核瞬间拉起时遭遇 bind: address already in use 从而直接崩溃。
+		time.Sleep(250 * time.Millisecond)
+	}
+
+	desired := c.Desired.Get()
+	if desired.ActiveConfig == "" {
+		behavior := c.Behavior.Get()
+		desired.ActiveConfig = behavior.ActiveConfig
+		desired.Mode = behavior.ActiveMode
+	}
+
+	needCore := desired.CoreRunning || desired.SystemProxy || desired.Tun
+
+	// 无论是否开启代理，都强行启动内核一次以验证配置正确性
+	if err := c.ensureCoreRunningWithDesiredState(ctx, desired); err != nil {
+		c.SyncState()
+		return err
+	}
+
+	if !needCore {
+		// 如果原本未开启代理服务，则启动验证成功后立刻关闭，不驻留后台
+		c.stopCoreProcessLocked()
+	}
+
+	// 发送通用的重启信号
+	c.events.Emit("core-restarted", map[string]any{
+		"reason": reason,
+	})
+
+	// 🛡️ 核心改进：仅在用户明确意图或核心配置变更时，才通知前端清理延迟缓存
+	switch reason {
+	case "manual", "config-switch", "subscription-update", "restore", "config-save":
+		c.events.Emit("delay-cache-clear", reason)
+	}
+
+	c.SyncState()
+	return nil
+}
+
+// UpdateClashMode 切换 Clash 路由模式
+func (c *Controller) UpdateClashMode(ctx context.Context, mode string) error {
+	behavior := c.Behavior.Get()
+	if behavior.ActiveMode == mode {
+		return nil
+	}
+
+	// 1. 更新配置并写盘
+	behavior.ActiveMode = mode
+	if err := c.Behavior.SetAndSave(behavior); err != nil {
+		c.events.Emit("notify-error", "模式持久化保存失败: "+err.Error())
+		c.SyncState()
+		return err
+	}
+
+	if err := c.Desired.Update(func(d *DesiredState) {
+		d.Mode = mode
+		c.fillDesiredTarget(d)
+	}); err != nil {
+		// Behavior is already persisted; a desired-state save failure leaves
+		// Behavior, kernel and desired state inconsistent.  Surface the error
+		// so the caller can retry rather than silently diverging.
+		c.SyncState()
+		return fmt.Errorf("模式切换 desired state 保存失败: %w", err)
+	}
+
+	// 2. 如果内核正在运行，尝试通过 API 热切换
+	if clash.IsRunning() {
+		if err := clash.UpdateModeWithContext(ctx, mode); err != nil {
+			c.SyncState()
+			return fmt.Errorf("内核模式切换失败: %v", err)
+		}
+
+		st := c.runtimeState.Get()
+		if st.Running && st.Purpose == "user" {
+			st.Mode = mode
+			c.runtimeState.Set(st)
+		}
+
+		// 🚀 核心修复：切换到全局模式时，主动同步隐藏 GLOBAL
+		if mode == "global" {
+			c.syncGlobalSelectionOnModeEnter(ctx, behavior.ActiveConfig)
+		}
+	}
+
+	c.SyncState()
+	return nil
+}
+
+// RefreshAutoDelayTest 刷新定时测速任务
+func (c *Controller) RefreshAutoDelayTest(opts AutoDelayRefreshOptions) {
+	c.autoTestMu.Lock()
+
+	if c.autoTestQuit != nil {
+		close(c.autoTestQuit)
+		c.autoTestQuit = nil
+	}
+
+	behavior := c.Behavior.Get()
+	if !behavior.AutoDelayTest {
+		c.autoTestMu.Unlock()
+		return
+	}
+
+	intervalMin := behavior.AutoDelayTestInterval
+	if intervalMin <= 0 {
+		intervalMin = 60
+	}
+
+	quit := make(chan struct{})
+	c.autoTestQuit = quit
+	c.autoTestMu.Unlock()
+
+	if opts.Immediate {
+		delay := autoDelayInitialDelay(opts.Reason)
+		go c.runAutoDelayTestOnceDelayed(quit, opts.Reason, delay)
+	}
+
+	go func(quit <-chan struct{}, intervalMin int) {
+		ticker := time.NewTicker(time.Duration(intervalMin) * time.Minute)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-quit:
+				return
+
+			case <-ticker.C:
+				c.runAutoDelayTestOnce("scheduled")
+			}
+		}
+	}(quit, intervalMin)
+}
+
+func autoDelayInitialDelay(reason string) time.Duration {
+	switch reason {
+	case "startup":
+		return 7 * time.Second // 冷启动给予 7s 宽限，避开系统启动高峰
+	case "restore":
+		return 15 * time.Second // 恢复备份后给予 15s 宽限
+	case "enabled":
+		return 3 * time.Second // 手动开启功能：3 秒
+	default:
+		return 5 * time.Second
+	}
+}
+
+func (c *Controller) runAutoDelayTestOnceDelayed(
+	quit <-chan struct{},
+	reason string,
+	delay time.Duration,
+) {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-quit:
+		return
+
+	case <-timer.C:
+		c.runAutoDelayTestOnce(reason)
+	}
+}
+
+func (c *Controller) runAutoDelayTestOnce(reason string) {
+	if c.ctx == nil {
+		return
+	}
+
+	behavior := c.Behavior.Get()
+	if !behavior.AutoDelayTest {
+		return
+	}
+
+	c.logInfo("Triggering auto delay test, reason: %s", reason)
+	go c.Delay.TestAllProxiesAuto(c.ctx, reason)
+}
+
+func (c *Controller) RefreshAppAutoUpdate() {
+	if c.ctx == nil {
+		return
+	}
+
+	behavior := c.Behavior.Get()
+	if !behavior.AutoUpdate {
+		return
+	}
+
+	now := time.Now().Unix()
+	shouldCheck := false
+
+	switch behavior.UpdateMethod {
+	case "startup":
+		shouldCheck = true
+
+	case "scheduled":
+		intervalDays := behavior.UpdateInterval
+		if intervalDays <= 0 {
+			intervalDays = 1
+		}
+
+		if behavior.LastUpdateCheck == 0 ||
+			now-behavior.LastUpdateCheck >= int64(intervalDays)*24*3600 {
+			shouldCheck = true
+		}
+
+	default:
+		shouldCheck = true
+	}
+
+	if !shouldCheck {
+		return
+	}
+
+	// 标记已检查，防止由于配置保存触发的副作用导致死循环
+	behavior.LastUpdateCheck = now
+	_ = c.Behavior.SetAndSave(behavior)
+
+	go c.AutoCheckAndDownloadAppUpdateAsync(c.ctx, c.version)
+}
+
+func (c *Controller) SaveAppBehavior(b AppBehavior) error {
+	old := c.Behavior.Get()
+
+	if err := c.Behavior.SetAndSave(b); err != nil {
+		return err
+	}
+
+	next := c.Behavior.Get()
+
+	// 副作用调度
+	if old.AutoDelayTest != next.AutoDelayTest ||
+		old.AutoDelayTestInterval != next.AutoDelayTestInterval {
+		c.RefreshAutoDelayTest(AutoDelayRefreshOptions{
+			Immediate: !old.AutoDelayTest && next.AutoDelayTest,
+			Reason:    "enabled",
+		})
+	}
+
+	if old.AutoUpdate != next.AutoUpdate ||
+		old.UpdateMethod != next.UpdateMethod ||
+		old.UpdateInterval != next.UpdateInterval {
+		c.RefreshAppAutoUpdate()
+	}
+
+	if old.LogLevel != next.LogLevel {
+		c.StartLogStream(c.ctx)
+	}
+
+	if old.AppLogLevel != next.AppLogLevel {
+		c.SyncState()
+	}
+
+	if old.LogLevel != next.LogLevel {
+		c.SyncState()
+	}
+
+	if old.ProxyTrafficOnly != next.ProxyTrafficOnly {
+		c.traffic.Stop()
+		c.traffic.ResetRuntimeState()
+		c.events.Emit("traffic-stat-mode-changed", next.ProxyTrafficOnly)
+	}
+
+	if old.StartupWithOS != next.StartupWithOS {
+		c.handleStartupWithOSChange(next.StartupWithOS)
+	}
+
+	// 端口代理模式被关闭时，清零 desired.PortProxy 并触发 reconcile，
+	// 防止 desired.PortProxy=true 残留导致内核无法停止
+	if old.PortProxyMode && !next.PortProxyMode {
+		_ = c.Desired.Update(func(d *DesiredState) {
+			d.PortProxy = false
+		})
+		c.Supervisor.ReconcileAsync("port-proxy-mode-disabled")
+	}
+
+	c.SyncState()
+	return nil
+}
+
+func (c *Controller) handleStartupWithOSChange(enable bool) {
+	exePath, err := os.Executable()
+	if err != nil {
+		c.events.Emit("app-state-sync", c.GetAppState())
+		return
+	}
+
+	// Always delete existing task before creating a new one to ensure clean update
+	_ = sys.DeleteStartupTask()
+
+	if enable {
+		if createTaskErr := sys.CreateStartupTask(exePath); createTaskErr != nil {
+			// Roll back on failure
+			behavior := c.Behavior.Get()
+			behavior.StartupWithOS = false
+			_ = c.Behavior.SetAndSave(behavior)
+			c.setLastError("设置开机自启失败: " + createTaskErr.Error())
+			c.events.Emit("app-state-sync", c.GetAppState())
+		}
+	}
+}
+
+func (c *Controller) StopTrafficStream() {
+	c.traffic.Stop()
+}
+
+func (c *Controller) ResetTrafficTotals() {
+	c.traffic.ResetRuntimeState()
+}
+
+// --- 日志流调度 ---
+
+func (c *Controller) StartLogStream(ctx context.Context) {
+	logLevel := c.Behavior.Get().LogLevel
+	if logLevel == "" {
+		logLevel = "info"
+	}
+	c.logs.Start(ctx, logLevel)
+}
+
+func (c *Controller) StopLogStream() {
+	c.logs.Stop()
+}
+
+func (c *Controller) GetRecentLogs() []logger.LogEntry {
+	return logger.AppLogs.GetAll()
+}
+
+func (c *Controller) SearchLogs(keyword string) []logger.LogEntry {
+	return logger.AppLogs.Search(keyword)
+}
+
+func (c *Controller) ClearLogs() {
+	logger.AppLogs.Clear()
+}
+
+func (c *Controller) GetConnections() (ConnectionsSnapshot, error) {
+	return c.connections.GetSnapshot()
+}
+
+func (c *Controller) StartConnectionMonitor(ctx context.Context) {
+	c.connections.Start(ctx)
+}
+
+func (c *Controller) StopConnectionMonitor() {
+	c.connections.Stop()
+}
+
+func (c *Controller) SetUpdateStatus(ready bool, version string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.updateReady = ready
+	c.newAppVersion = version
+}
+
+func (c *Controller) SetDownloadedAppUpdate(path, version string) {
+	c.mu.Lock()
+	changed := c.downloadedUpdatePath != path || c.downloadedUpdateVersion != version
+	c.downloadedUpdatePath = path
+	c.downloadedUpdateVersion = version
+	c.mu.Unlock()
+
+	if changed {
+		c.SyncState()
+	}
+}
+
+// --- Proxy Selection & Sync ---
+
+func (c *Controller) SelectProxyWithModeSync(
+	ctx context.Context,
+	profileID string,
+	mode string,
+	groupName string,
+	proxyName string,
+) error {
+	// 🚀 核心修复：全局模式下采取“先校验、双切换、双持久化”的严格路径
+	if mode == "global" {
+		// 1. 预校验 GLOBAL 是否支持该节点
+		if err := c.validateProxySelection(ctx, groupName, proxyName, true); err != nil {
+			return fmt.Errorf("全局同步预校验失败: %w", err)
+		}
+
+		// 2. 依次切换正常组和 GLOBAL 组
+		if err := clash.SelectProxyWithContext(ctx, groupName, proxyName); err != nil {
+			return fmt.Errorf("切换代理组失败: %w", err)
+		}
+		if err := clash.SelectProxyWithContext(ctx, "GLOBAL", proxyName); err != nil {
+			return fmt.Errorf("同步全局出口失败: %w", err)
+		}
+
+		// 3. 依次记录持久化状态
+		c.Offline.Mark(profileID, groupName, proxyName)
+		c.Offline.Mark(profileID, "GLOBAL", proxyName)
+
+	} else {
+		// 规则/直连模式：仅切换正常组
+		if err := clash.SelectProxyWithContext(ctx, groupName, proxyName); err != nil {
+			return err
+		}
+		c.Offline.Mark(profileID, groupName, proxyName)
+	}
+
+	c.SyncProxyStateOnce()
+	return nil
+}
+
+func (c *Controller) validateProxySelection(ctx context.Context, groupName, nodeName string, checkGlobal bool) error {
+	if nodeName == "" || nodeName == "DIRECT" || nodeName == "REJECT" {
+		return fmt.Errorf("无效的节点名称: %s", nodeName)
+	}
+
+	data, err := clash.GetInitialDataWithContext(ctx)
+	if err != nil {
+		return err
+	}
+
+	groups, ok := data["groups"].(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("无效的代理组数据")
+	}
+
+	// 1. 校验目标组是否包含该节点
+	if g, ok := groups[groupName].(map[string]interface{}); ok {
+		if !proxyGroupContainsNode(g, nodeName) {
+			return fmt.Errorf("代理组 %s 不包含节点 %s", groupName, nodeName)
+		}
+	} else {
+		return fmt.Errorf("代理组 %s 不存在", groupName)
+	}
+
+	// 2. 可选：校验 GLOBAL 是否包含该节点
+	if checkGlobal {
+		if g, ok := groups["GLOBAL"].(map[string]interface{}); ok {
+			if !proxyGroupContainsNode(g, nodeName) {
+				return fmt.Errorf("全局出口 (GLOBAL) 不支持节点 %s", nodeName)
+			}
+		} else {
+			return fmt.Errorf("GLOBAL 组不存在，无法同步")
+		}
+	}
+
+	return nil
+}
+
+func (c *Controller) syncGlobalSelectionOnModeEnter(ctx context.Context, profileID string) {
+	// 🚀 核心逻辑：
+	// 优先寻找已有的 GLOBAL 持久化记录
+	// 如果没有，则寻找一个有效的手动可选组的选择作为兜底同步
+	targetNode, exists := c.Offline.Get(profileID, "GLOBAL")
+
+	if !exists {
+		// 搜索其他可选组的选择
+		selections := c.Offline.Snapshot(profileID)
+		for gName, node := range selections {
+			if gName == "GLOBAL" {
+				continue
+			}
+			// 如果找到了一个节点，且它在 GLOBAL 中合法，就用它
+			if err := c.selectGlobalProxyIfValid(ctx, node); err == nil {
+				c.Offline.Mark(profileID, "GLOBAL", node)
+				return
+			}
+		}
+		return
+	}
+
+	// 执行同步
+	if err := c.selectGlobalProxyIfValid(ctx, targetNode); err != nil {
+		c.logError("进入全局模式同步失败: %v", err)
+	}
+}
+
+func (c *Controller) SelectOfflineProxyWithModeSync(
+	profileID string,
+	mode string,
+	groupName string,
+	proxyName string,
+) {
+	c.Offline.Mark(profileID, groupName, proxyName)
+
+	if mode == "global" {
+		c.Offline.Mark(profileID, "GLOBAL", proxyName)
+	}
+}
+
+func (c *Controller) selectGlobalProxyIfValid(ctx context.Context, proxyName string) error {
+	if proxyName == "" || proxyName == "DIRECT" || proxyName == "REJECT" {
+		return fmt.Errorf("无效的全局出口节点: %s", proxyName)
+	}
+
+	data, err := clash.GetInitialDataWithContext(ctx)
+	if err != nil {
+		return err
+	}
+
+	groups, ok := data["groups"].(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("内核代理组数据无效")
+	}
+
+	raw, ok := groups["GLOBAL"]
+	if !ok {
+		return fmt.Errorf("GLOBAL 组不存在")
+	}
+
+	globalGroup, ok := raw.(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("GLOBAL 组数据无效")
+	}
+
+	if !proxyGroupContainsNode(globalGroup, proxyName) {
+		return fmt.Errorf("GLOBAL 不包含节点: %s", proxyName)
+	}
+
+	return clash.SelectProxyWithContext(ctx, "GLOBAL", proxyName)
+}
+
+func (c *Controller) applyStoredProxySelections(ctx context.Context, profileID string) {
+	selected := c.Offline.Snapshot(profileID)
+	if len(selected) == 0 {
+		return
+	}
+
+	data, err := clash.GetInitialDataWithContext(ctx)
+	if err != nil {
+		c.logError("读取内核代理组失败，跳过节点选择回放: %v", err)
+		return
+	}
+
+	groups, ok := data["groups"].(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	// 1. 先回放正常可选组
+	for groupName, nodeName := range selected {
+		if groupName == "GLOBAL" {
+			continue
+		}
+
+		raw, ok := groups[groupName]
+		if !ok {
+			continue
+		}
+
+		group, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		groupType, _ := group["type"].(string)
+		if !isUserSelectableProxyGroupType(groupType) {
+			continue
+		}
+
+		if !proxyGroupContainsNode(group, nodeName) {
+			continue
+		}
+
+		_ = clash.SelectProxyWithContext(ctx, groupName, nodeName)
+	}
+
+	// 2. 全局模式下回放隐藏 GLOBAL
+	behavior := c.Behavior.Get()
+	if behavior.ActiveMode == "global" {
+		if globalNode, ok := selected["GLOBAL"]; ok && globalNode != "" {
+			if err := c.selectGlobalProxyIfValid(ctx, globalNode); err != nil {
+				c.logError("回放 GLOBAL 出口失败: %v", err)
+			}
+		}
+	}
+}
+
+func (c *Controller) SyncProxyStateOnce() {
+	if c.proxyState != nil {
+		c.proxyState.SyncOnce()
+	}
+}
+
+func isUserSelectableProxyGroupType(t string) bool {
+	switch t {
+	case "Selector", "Fallback":
+		return true
+	default:
+		return false
+	}
+}
+
+func proxyGroupContainsNode(group map[string]interface{}, nodeName string) bool {
+	all, ok := group["all"].([]interface{})
+	if !ok {
+		return false
+	}
+	for _, v := range all {
+		if s, ok := v.(string); ok && s == nodeName {
+			return true
+		}
+	}
+	return false
+}
+
+// GetDiagnosticInfo returns current diagnostic info
+func (c *Controller) GetDiagnosticInfo() DiagnosticInfo {
+	return GetDiagnosticInfo()
+}
+
+// ExportDiagnostics exports diagnostics to a user-selected path
+func (c *Controller) ExportDiagnostics() error {
+	path, err := runtime.SaveFileDialog(c.ctx, runtime.SaveDialogOptions{
+		DefaultFilename: "clashmeta_diagnostics.json",
+		Title:           "导出诊断信息",
+		Filters: []runtime.FileFilter{
+			{DisplayName: "JSON Files (*.json)", Pattern: "*.json"},
+		},
+	})
+	if err != nil || path == "" {
+		return err // cancelled or error
+	}
+	return ExportDiagnosticsToFile(path)
+}

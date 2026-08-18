@@ -1,0 +1,573 @@
+//go:build windows
+
+package clash
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+// DefaultDelayTestURL 默认的全球联通性测速地址，与 NetworkConfig 默认值保持一致
+const DefaultDelayTestURL = "http://www.gstatic.com/generate_204"
+
+// 🚀 1. 定义全局共享的无代理 Transport，加入 TCP 探活机制
+var noProxyTransport = &http.Transport{
+	Proxy: nil,
+	// 👇 核心修复：强制 TCP 层面每 15 秒探活一次，防止假死连接让解码器永久阻塞
+	DialContext: (&net.Dialer{
+		Timeout:   5 * time.Second,
+		KeepAlive: 15 * time.Second,
+	}).DialContext,
+	MaxIdleConns:        100,              // 最大空闲连接数
+	IdleConnTimeout:     90 * time.Second, // 空闲超时时间
+	TLSHandshakeTimeout: 10 * time.Second,
+}
+
+// 🚀 2. 声明各场景的全局单例 Client
+var localAPIClient = &http.Client{
+	Transport: noProxyTransport,
+	Timeout:   2 * time.Second,
+}
+
+var speedTestClient = &http.Client{
+	Transport: noProxyTransport,
+}
+
+var streamClient = &http.Client{
+	Transport: noProxyTransport, // 日志流/长连接专用，无超时
+}
+
+// 🚀 3. 统一 API 基准地址管理，彻底消灭 127.0.0.1:9090 硬编码
+var apiBase = struct {
+	sync.RWMutex
+	value string
+}{
+	value: "http://127.0.0.1:9090", // 默认兜底
+}
+
+// apiSecret stores the bearer token for the external controller API.
+var apiSecret = struct {
+	sync.RWMutex
+	value string
+}{}
+
+// UpdateAPISecret updates the bearer token used in all API requests.
+func UpdateAPISecret(secret string) {
+	apiSecret.Lock()
+	apiSecret.value = secret
+	apiSecret.Unlock()
+}
+
+// addAPIAuth adds an Authorization header when a secret is configured.
+func addAPIAuth(req *http.Request) {
+	apiSecret.RLock()
+	s := apiSecret.value
+	apiSecret.RUnlock()
+	if s != "" {
+		req.Header.Set("Authorization", "Bearer "+s)
+	}
+}
+
+func NormalizeControllerHostPort(controller string) string {
+	controller = strings.TrimSpace(controller)
+	if controller == "" {
+		return "127.0.0.1:9090"
+	}
+	// 用户只填端口，比如 9091
+	if _, err := strconv.Atoi(controller); err == nil {
+		return "127.0.0.1:" + controller
+	}
+	// 用户误填 URL，比如 http://127.0.0.1:9090
+	if strings.Contains(controller, "://") {
+		u, err := url.Parse(controller)
+		if err == nil && u.Host != "" {
+			controller = u.Host
+		}
+	}
+	host, port, err := net.SplitHostPort(controller)
+	if err != nil || host == "" || port == "" {
+		return "127.0.0.1:9090"
+	}
+	// 🌟 核心改进：允许非本地 IP（如软路由、NAS、远程服务器），解除“逻辑硬伤”
+	// 但如果 host 为空或非法，依然返回兜底地址
+	if host == "" || port == "" {
+		return "127.0.0.1:9090"
+	}
+	return net.JoinHostPort(strings.Trim(host, "[]"), port)
+}
+
+func normalizeAPIBaseURL(controller string) string {
+	controller = NormalizeControllerHostPort(controller)
+
+	// 0.0.0.0 或 :: 是全网卡监听地址，Go 客户端在发起 HTTP 连接时必须替换为 127.0.0.1 本地回环地址，
+	// 避免 Windows 系统下向 0.0.0.0 发起 connect 请求时抛出 socket error。
+	if host, port, err := net.SplitHostPort(controller); err == nil {
+		cleanHost := strings.Trim(host, "[]")
+		if cleanHost == "0.0.0.0" || cleanHost == "::" || cleanHost == "" {
+			controller = net.JoinHostPort("127.0.0.1", port)
+		}
+	}
+
+	// 补全协议头
+	if !strings.HasPrefix(controller, "http://") && !strings.HasPrefix(controller, "https://") {
+		controller = "http://" + controller
+	}
+
+	u, err := url.Parse(controller)
+	if err != nil || u.Host == "" {
+		return "http://127.0.0.1:9090"
+	}
+
+	// 规格化：只保留协议、主机和端口
+	u.Path = ""
+	u.RawQuery = ""
+	u.Fragment = ""
+
+	return strings.TrimRight(u.String(), "/")
+}
+
+// UpdateAPIBaseURL 动态更新内核控制接口的基础地址
+func UpdateAPIBaseURL(controller string) {
+	apiBase.Lock()
+	apiBase.value = normalizeAPIBaseURL(controller)
+	apiBase.Unlock()
+}
+
+// APIURL 构造完整的 HTTP 请求地址
+func APIURL(path string) string {
+	apiBase.RLock()
+	base := apiBase.value
+	apiBase.RUnlock()
+
+	if base == "" {
+		base = "http://127.0.0.1:9090"
+	}
+
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+
+	return base + path
+}
+
+// APIWSURL 构造完整的 WebSocket 请求地址
+func APIWSURL(path string) string {
+	apiBase.RLock()
+	base := apiBase.value
+	apiBase.RUnlock()
+
+	if base == "" {
+		base = "http://127.0.0.1:9090"
+	}
+
+	u, err := url.Parse(base)
+	if err != nil {
+		return "ws://127.0.0.1:9090" + path
+	}
+
+	// 协议转换
+	if u.Scheme == "https" {
+		u.Scheme = "wss"
+	} else {
+		u.Scheme = "ws"
+	}
+
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+
+	u.Path = path
+	u.RawQuery = ""
+
+	return u.String()
+}
+
+// APIWSURLWithRawQuery 构造带参数的 WebSocket 请求地址
+func APIWSURLWithRawQuery(path string, rawQuery string) string {
+	u, _ := url.Parse(APIWSURL(path))
+	u.RawQuery = rawQuery
+	return u.String()
+}
+
+// FetchLogs 获取实时日志流并执行回调（带自动重连）
+func FetchLogs(ctx context.Context, level string, onLog func(data interface{})) {
+	if level == "" {
+		level = "info" // 兜底默认值
+	}
+
+	for {
+		// 快速响应外部的 Cancel 信号
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		apiURL := APIURL("/logs?level=" + url.QueryEscape(level))
+		req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+		if err != nil {
+			timer := time.NewTimer(2 * time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop() // 👈 手动释放内存
+				return
+			case <-timer.C:
+			}
+			continue
+		}
+
+		addAPIAuth(req)
+		resp, err := streamClient.Do(req)
+		if err != nil {
+			timer := time.NewTimer(2 * time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop() // 👈 手动释放内存
+				return
+			case <-timer.C:
+			}
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			timer := time.NewTimer(2 * time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			continue
+		}
+
+		const logIdleTimeout = 70 * time.Second
+		decoder := json.NewDecoder(resp.Body)
+		idleTimer := time.NewTimer(logIdleTimeout)
+		stopIdle := make(chan struct{})
+
+		// 🚀 新增：Idle Watchdog 协程
+		go func() {
+			select {
+			case <-ctx.Done():
+				resp.Body.Close()
+			case <-idleTimer.C:
+				// 超过 70 秒没有收到任何日志，主动断开以触发重连
+				resp.Body.Close()
+			case <-stopIdle:
+				// 循环结束，停止监控
+			}
+		}()
+
+		for {
+			var logData map[string]interface{}
+			if err := decoder.Decode(&logData); err != nil {
+				close(stopIdle)
+				if !idleTimer.Stop() {
+					select {
+					case <-idleTimer.C:
+					default:
+					}
+				}
+				resp.Body.Close()
+				break
+			}
+
+			// 收到数据，重置探活计时器
+			if !idleTimer.Stop() {
+				select {
+				case <-idleTimer.C:
+				default:
+				}
+			}
+			idleTimer.Reset(logIdleTimeout)
+
+			onLog(logData)
+		}
+	}
+}
+
+// GetProxyDelay 调用内核 API 测试节点延迟
+func GetProxyDelay(ctx context.Context, proxyName string, testUrl string, timeoutMs int) (int, error) {
+	encodedName := url.PathEscape(proxyName)
+
+	// 🛡️ 核心优化：使用全局统一的默认测速地址
+	if testUrl == "" {
+		testUrl = DefaultDelayTestURL
+	}
+
+	if timeoutMs <= 0 {
+		timeoutMs = 7000
+	}
+
+	apiURL := fmt.Sprintf("%s?timeout=%d&url=%s",
+		APIURL("/proxies/"+encodedName+"/delay"),
+		timeoutMs,
+		url.QueryEscape(testUrl))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return -1, err
+	}
+
+	// 🚀 使用已移除强行 Timeout 的 client，全权交由 reqCtx 控制
+	addAPIAuth(req)
+	resp, err := speedTestClient.Do(req)
+	if err != nil {
+		return -1, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		msg := strings.TrimSpace(string(body))
+		if msg == "" {
+			msg = resp.Status
+		}
+		return -1, fmt.Errorf("mihomo delay failed: HTTP %d: %s", resp.StatusCode, msg)
+	}
+
+	var result struct {
+		Delay int `json:"delay"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return -1, err
+	}
+
+	if result.Delay <= 0 {
+		return -1, fmt.Errorf("invalid delay format")
+	}
+
+	return result.Delay, nil
+}
+
+// TestProxy 简易测速工具：单次测速，使用 8秒 超时和默认 URL
+func TestProxy(name string) (int, error) {
+	testUrl := DefaultDelayTestURL
+	if netCfg, err := GetNetworkConfig(); err == nil && netCfg != nil {
+		if u := strings.TrimSpace(netCfg.TestURL); u != "" {
+			testUrl = u
+		}
+	}
+
+	timeoutMs := 8000
+	// 🚀 核心优化：Go context 超时应略大于 mihomo timeout，给网络栈留一点收尾时间
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs+1500)*time.Millisecond)
+	defer cancel()
+
+	return GetProxyDelay(ctx, name, testUrl, timeoutMs)
+}
+
+func require2xx(resp *http.Response, endpoint string) error {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("%s failed: HTTP %d", endpoint, resp.StatusCode)
+	}
+	return nil
+}
+
+// 🚀 [泛型优化]：统一 GET 请求处理，消灭 40 行模板代码
+func doKernelGet[T any](path string) (T, error) {
+	return doKernelGetWithContext[T](context.Background(), path)
+}
+
+func doKernelGetWithContext[T any](ctx context.Context, path string) (T, error) {
+	var result T
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, APIURL(path), nil)
+	if err != nil {
+		return result, err
+	}
+	addAPIAuth(req)
+
+	resp, err := localAPIClient.Do(req)
+	if err != nil {
+		return result, err
+	}
+	defer resp.Body.Close()
+
+	if err := require2xx(resp, path); err != nil {
+		return result, err
+	}
+
+	err = json.NewDecoder(resp.Body).Decode(&result)
+	return result, err
+}
+
+func doKernelRequest(ctx context.Context, method, path string, body any, okStatus ...int) error {
+	var reader io.Reader
+
+	if body != nil {
+		payload, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		reader = bytes.NewReader(payload)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, APIURL(path), reader)
+	if err != nil {
+		return err
+	}
+
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	addAPIAuth(req)
+
+	resp, err := localAPIClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	for _, status := range okStatus {
+		if resp.StatusCode == status {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("内核 API 调用失败: %s %s -> HTTP %d", method, path, resp.StatusCode)
+}
+
+// GetInitialData 获取模式和代理组信息
+func GetInitialData() (map[string]interface{}, error) {
+	return GetInitialDataWithContext(context.Background())
+}
+
+// PingAPIWithContext 轻量级 API 探针，只检查核心是否有反应
+func PingAPIWithContext(ctx context.Context) error {
+	_, err := doKernelGetWithContext[map[string]interface{}](ctx, "/configs")
+	return err
+}
+
+func GetInitialDataWithContext(ctx context.Context) (map[string]interface{}, error) {
+	configData, err := doKernelGetWithContext[map[string]interface{}](ctx, "/configs")
+	if err != nil {
+		return nil, err
+	}
+
+	proxiesData, err := doKernelGetWithContext[map[string]interface{}](ctx, "/proxies")
+	if err != nil {
+		return nil, err
+	}
+
+	return map[string]interface{}{
+		"mode":   configData["mode"],
+		"groups": proxiesData["proxies"],
+	}, nil
+}
+
+// UpdateMode 切换代理模式
+func UpdateMode(mode string) error {
+	return UpdateModeWithContext(context.Background(), mode)
+}
+
+func UpdateModeWithContext(ctx context.Context, mode string) error {
+	return doKernelRequest(
+		ctx,
+		http.MethodPatch,
+		"/configs",
+		map[string]string{"mode": mode},
+		http.StatusOK,
+		http.StatusNoContent,
+	)
+}
+
+// SelectProxy 切换代理节点
+func SelectProxy(groupName, proxyName string) error {
+	return SelectProxyWithContext(context.Background(), groupName, proxyName)
+}
+
+func SelectProxyWithContext(ctx context.Context, groupName, proxyName string) error {
+	return doKernelRequest(
+		ctx,
+		http.MethodPut,
+		"/proxies/"+url.PathEscape(groupName),
+		map[string]string{"name": proxyName},
+		http.StatusOK,
+		http.StatusNoContent,
+	)
+}
+
+// GetConnectionsRaw 获取实时连接原始数据
+func GetConnectionsRaw() ([]byte, error) {
+	resp, err := localAPIClient.Get(APIURL("/connections"))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if err := require2xx(resp, "/connections"); err != nil {
+		return nil, err
+	}
+
+	var buf bytes.Buffer
+	_, err = buf.ReadFrom(resp.Body)
+	return buf.Bytes(), err
+}
+
+// CloseConnection 断开指定的单个连接
+func CloseConnection(id string) error {
+	return doKernelRequest(
+		context.Background(),
+		http.MethodDelete,
+		"/connections/"+url.PathEscape(id),
+		nil,
+		http.StatusOK,
+		http.StatusNoContent,
+	)
+}
+
+// CloseAllConnections 断开所有活动连接
+func CloseAllConnections() error {
+	return doKernelRequest(
+		context.Background(),
+		http.MethodDelete,
+		"/connections",
+		nil,
+		http.StatusOK,
+		http.StatusNoContent,
+	)
+}
+
+// GetVersion 获取内核版本号
+func GetVersion() string {
+	data, err := doKernelGet[map[string]string]("/version")
+	if err != nil {
+		return ""
+	}
+	return data["version"]
+}
+
+// FlushFakeIP 刷新 Fake-IP 缓存（带前置条件检查）
+func FlushFakeIP() error {
+	// 1. 读取当前的 DNS 配置，判断是否是 Fake-IP 模式
+	dnsCfg, err := GetDNSConfig()
+	if err != nil || dnsCfg == nil {
+		return fmt.Errorf("通信失败：无法获取当前 DNS 状态，请检查内核是否运行")
+	}
+
+	// 2. 如果根本不是 Fake-IP 模式，直接返回，不打扰内核
+	if dnsCfg.EnhancedMode != "fake-ip" {
+		return fmt.Errorf("当前为 %s 模式，仅 Fake-IP 模式支持刷新缓存", dnsCfg.EnhancedMode)
+	}
+
+	// 3. 只有确认是 Fake-IP 模式，才真正向内核发送清理请求
+	return doKernelRequest(
+		context.Background(),
+		http.MethodPost,
+		"/cache/fakeip/flush",
+		nil,
+		http.StatusOK,
+		http.StatusNoContent,
+	)
+}

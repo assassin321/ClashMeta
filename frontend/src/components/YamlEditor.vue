@@ -1,0 +1,575 @@
+<template>
+  <div class="yaml-editor-view">
+    <div class="yaml-toolbar">
+      <div class="editor-left">
+        <button class="back-btn" @click="$emit('back')" title="返回">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none"
+               stroke="currentColor" stroke-width="2">
+            <line x1="19" y1="12" x2="5" y2="12"></line>
+            <polyline points="12 19 5 12 12 5"></polyline>
+          </svg>
+        </button>
+
+        <div class="file-meta">
+          <div class="file-name">{{ configName || '配置文件' }}</div>
+          <div class="file-path">{{ fileName }}</div>
+        </div>
+      </div>
+
+      <div class="editor-actions">
+        <button class="action-btn" @click="handleValidate" :disabled="validating">
+          {{ validating ? '校验中...' : '检查语法' }}
+        </button>
+        <button class="action-btn" @click="handleReload" :disabled="loading">重新加载</button>
+        <button class="primary-btn accent-btn mini-btn" @click="handleSave" :disabled="!isModified || saving">
+          {{ saving ? '保存中...' : '保存' }}
+        </button>
+      </div>
+    </div>
+
+    <div class="editor-body" ref="editorContainer"></div>
+
+    <div v-if="props.configType === 'remote'" class="remote-warning">
+      <span>当前为远程订阅配置。建议通过【规则页】的附加规则修改。在此修改将在下次订阅更新时被覆盖。</span>
+    </div>
+
+    <div class="editor-summary-bar">
+      <span>共 {{ totalLines }} 行</span>
+      <span>{{ totalChars }} 字符</span>
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, onMounted, onUnmounted, shallowRef } from 'vue';
+import { EditorView } from 'codemirror';
+import { EditorState, Compartment } from '@codemirror/state';
+import { yaml } from '@codemirror/lang-yaml';
+import { keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, dropCursor } from '@codemirror/view';
+import { indentWithTab, defaultKeymap, historyKeymap } from '@codemirror/commands';
+import { history } from '@codemirror/commands';
+import { HighlightStyle, syntaxHighlighting, indentOnInput, bracketMatching, foldGutter, foldKeymap } from '@codemirror/language';
+import { closeBrackets, closeBracketsKeymap, completionKeymap } from '@codemirror/autocomplete';
+import { searchKeymap } from '@codemirror/search';
+import { tags } from '@lezer/highlight';
+import * as API from '../../wailsjs/go/main/App';
+import { globalState, showConfirm, showAlert } from '../store';
+
+const props = defineProps<{
+  configId: string;
+  configName: string;
+  configType: 'local' | 'remote';
+}>();
+
+const emit = defineEmits<{
+  back: [];
+  'status-change': [payload: { text: string; modified: boolean; error: boolean }];
+  'cursor-change': [payload: { line: number; col: number }];
+}>();
+
+const editorContainer = ref<HTMLElement>();
+const editorView = shallowRef<EditorView>();
+const themeCompartment = new Compartment();
+const highlightCompartment = new Compartment();
+const loading = ref(false);
+const saving = ref(false);
+const validating = ref(false);
+const isModified = ref(false);
+const fileName = ref('');
+const originalContent = ref('');
+const cursorLine = ref(1);
+const cursorCol = ref(1);
+const totalLines = ref(1);
+const totalChars = ref(0);
+const statusText = ref('已保存');
+const yamlError = ref('');
+
+// 自定义 editor setup：不引入 basicSetup / highlightSelectionMatches / drawSelection
+const editorBaseSetup = [
+  lineNumbers(),
+  highlightActiveLineGutter(),
+  history(),
+  foldGutter(),
+  dropCursor(),
+  indentOnInput(),
+  bracketMatching(),
+  closeBrackets(),
+  highlightActiveLine(),
+  keymap.of([
+    indentWithTab,
+    ...closeBracketsKeymap,
+    ...defaultKeymap,
+    ...searchKeymap,
+    ...historyKeymap,
+    ...foldKeymap,
+    ...completionKeymap,
+  ]),
+];
+
+const lightTheme = EditorView.theme({
+  '&': {
+    backgroundColor: '#FFFFFF',
+    color: '#000000',
+  },
+  '.cm-content': {
+    caretColor: '#000000',
+    fontFamily: "'JetBrains Mono', 'MiSans', monospace",
+    fontSize: '14px',
+    lineHeight: '1.6',
+  },
+  '.cm-cursor': {
+    borderLeftColor: '#000000',
+  },
+  '& ::selection': {
+    backgroundColor: '#000000',
+    color: '#FFFFFF',
+  },
+  '.cm-content ::selection': {
+    backgroundColor: '#000000',
+    color: '#FFFFFF',
+  },
+  '.cm-line ::selection': {
+    backgroundColor: '#000000',
+    color: '#FFFFFF',
+  },
+  '.cm-selectionBackground': {
+    backgroundColor: '#000000 !important',
+  },
+  '.cm-gutters': {
+    backgroundColor: '#F5F5F5',
+    color: '#AAAAAA',
+    borderRight: '1px solid #E5E5E5',
+    borderTopLeftRadius: '12px',
+    borderBottomLeftRadius: '12px',
+  },
+  '.cm-activeLineGutter': {
+    backgroundColor: '#EEEEEE',
+    color: '#1A1A1A',
+  },
+  '.cm-activeLine': {
+    backgroundColor: '#F8F8F8',
+  },
+  '.cm-foldPlaceholder': {
+    backgroundColor: '#E5E5E5',
+    border: 'none',
+    color: '#777777',
+  },
+});
+
+const darkTheme = EditorView.theme({
+  '&': {
+    backgroundColor: '#0D1117',
+    color: '#FFFFFF',
+  },
+  '.cm-content': {
+    caretColor: '#FFFFFF',
+    fontFamily: "'JetBrains Mono', 'MiSans', monospace",
+    fontSize: '14px',
+    lineHeight: '1.6',
+  },
+  '.cm-cursor': {
+    borderLeftColor: '#FFFFFF',
+  },
+  '& ::selection': {
+    backgroundColor: '#FFFFFF',
+    color: '#000000',
+  },
+  '.cm-content ::selection': {
+    backgroundColor: '#FFFFFF',
+    color: '#000000',
+  },
+  '.cm-line ::selection': {
+    backgroundColor: '#FFFFFF',
+    color: '#000000',
+  },
+  '.cm-selectionBackground': {
+    backgroundColor: '#FFFFFF !important',
+  },
+  '.cm-gutters': {
+    backgroundColor: '#111111',
+    color: '#555555',
+    borderRight: '1px solid #2A2A2A',
+    borderTopLeftRadius: '12px',
+    borderBottomLeftRadius: '12px',
+  },
+  '.cm-activeLineGutter': {
+    backgroundColor: '#222222',
+    color: '#E8E8E8',
+  },
+  '.cm-activeLine': {
+    backgroundColor: '#1E1E1E',
+  },
+  '.cm-foldPlaceholder': {
+    backgroundColor: '#333333',
+    border: 'none',
+    color: '#888888',
+  },
+});
+
+const monoHighlight = HighlightStyle.define([
+  { tag: tags.keyword, color: 'var(--text-main)', fontWeight: '700' },
+  { tag: tags.atom, color: 'var(--text-main)' },
+  { tag: tags.bool, color: 'var(--text-main)', fontWeight: '700' },
+  { tag: tags.comment, color: 'var(--text-sub)', fontStyle: 'italic' },
+  { tag: tags.string, color: 'var(--text-main)' },
+  { tag: tags.number, color: 'var(--text-main)' },
+  { tag: tags.propertyName, color: 'var(--text-main)', fontWeight: '600' },
+  { tag: tags.operator, color: 'var(--text-sub)' },
+  { tag: tags.invalid, color: 'var(--text-main)', textDecoration: 'underline wavy' },
+]);
+
+const isDark = () => document.documentElement.classList.contains('dark');
+
+const getTheme = () => isDark() ? darkTheme : lightTheme;
+const getHighlight = () => monoHighlight;
+
+const updateEditorStats = (view: EditorView) => {
+  totalLines.value = view.state.doc.lines;
+  totalChars.value = view.state.doc.length;
+
+  const pos = view.state.selection.main.head;
+  const line = view.state.doc.lineAt(pos);
+  cursorLine.value = line.number;
+  cursorCol.value = pos - line.from + 1;
+
+  emit('cursor-change', { line: cursorLine.value, col: cursorCol.value });
+};
+
+const createExtensions = () => [
+  ...editorBaseSetup,
+  yaml(),
+  EditorView.lineWrapping,
+  themeCompartment.of(getTheme()),
+  highlightCompartment.of(syntaxHighlighting(getHighlight())),
+  EditorView.updateListener.of((update) => {
+    if (!editorView.value) return;
+
+    updateEditorStats(update.view);
+
+    if (update.docChanged) {
+      isModified.value = update.state.doc.toString() !== originalContent.value;
+      statusText.value = isModified.value ? '未保存' : '已保存';
+
+      emit('status-change', {
+        text: isModified.value ? '未保存' : '已保存',
+        modified: isModified.value,
+        error: false,
+      });
+    }
+  }),
+];
+
+const loadConfig = async () => {
+  loading.value = true;
+  try {
+    const result = await API.ReadConfigText(props.configId);
+    fileName.value = result.name;
+    originalContent.value = result.content;
+    isModified.value = false;
+    statusText.value = '已保存';
+    yamlError.value = '';
+
+    emit('status-change', { text: '已保存', modified: false, error: false });
+
+    if (editorView.value) {
+      editorView.value.dispatch({
+        changes: {
+          from: 0,
+          to: editorView.value.state.doc.length,
+          insert: result.content,
+        },
+      });
+      updateEditorStats(editorView.value);
+    } else if (editorContainer.value) {
+      const state = EditorState.create({
+        doc: result.content,
+        extensions: createExtensions(),
+      });
+      editorView.value = new EditorView({
+        state,
+        parent: editorContainer.value,
+      });
+      updateEditorStats(editorView.value);
+    }
+  } catch (e: any) {
+    const errorMsg = e.message || String(e);
+    statusText.value = '加载失败: ' + errorMsg;
+    emit('status-change', { text: '加载失败', modified: false, error: true });
+    
+    // 如果读取配置失败（如严格路径校验不通过），弹出提示并返回
+    showAlert('配置文件读取失败: ' + errorMsg, '错误', true);
+  } finally {
+    loading.value = false;
+  }
+};
+
+const handleSave = async () => {
+  if (!isModified.value) return;
+  saving.value = true;
+  statusText.value = '保存中...';
+  try {
+    const content = editorView.value?.state.doc.toString() || '';
+    await API.SaveConfigText(props.configId, content);
+    originalContent.value = content;
+    isModified.value = false;
+    statusText.value = '已保存';
+    yamlError.value = '';
+
+    emit('status-change', { text: '已保存', modified: false, error: false });
+  } catch (e: any) {
+    const errorMsg = e.message || String(e);
+    statusText.value = '保存失败: ' + errorMsg;
+    emit('status-change', { text: '保存失败', modified: isModified.value, error: true });
+    
+    showAlert('配置文件保存失败: ' + errorMsg, '错误', true);
+  } finally {
+    saving.value = false;
+  }
+};
+
+const handleValidate = async () => {
+  validating.value = true;
+  try {
+    const content = editorView.value?.state.doc.toString() || '';
+    await API.ValidateConfigText(content);
+    yamlError.value = '';
+    statusText.value = 'YAML 语法正确';
+
+    emit('status-change', { text: 'YAML 语法正确', modified: isModified.value, error: false });
+  } catch (e: any) {
+    yamlError.value = e.message || String(e);
+    statusText.value = 'YAML 错误: ' + yamlError.value;
+
+    emit('status-change', { text: 'YAML 错误', modified: isModified.value, error: true });
+  } finally {
+    validating.value = false;
+  }
+};
+
+const handleReload = async () => {
+  if (isModified.value) {
+    const ok = await showConfirm('当前有未保存的修改，确定要重新加载吗？', '提示');
+    if (!ok) return;
+  }
+  loadConfig();
+};
+
+const handleKeydown = (e: KeyboardEvent) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+    e.preventDefault();
+    handleSave();
+  }
+};
+
+let themeObserver: MutationObserver | null = null;
+
+onMounted(async () => {
+  await loadConfig();
+  document.addEventListener('keydown', handleKeydown);
+  themeObserver = new MutationObserver(() => {
+    if (editorView.value) {
+      const currentTheme = isDark() ? darkTheme : lightTheme;
+      const currentHighlight = monoHighlight;
+      editorView.value.dispatch({
+        effects: [
+          themeCompartment.reconfigure(currentTheme),
+          highlightCompartment.reconfigure(syntaxHighlighting(currentHighlight)),
+        ],
+      });
+    }
+  });
+  themeObserver.observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: ['class'],
+  });
+});
+
+onUnmounted(() => {
+  editorView.value?.destroy();
+  document.removeEventListener('keydown', handleKeydown);
+  themeObserver?.disconnect();
+});
+</script>
+
+<style scoped>
+.yaml-editor-view {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+  overflow: visible;
+  gap: 16px;
+}
+
+.yaml-toolbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 4px 0 12px 0;
+  background: transparent;
+}
+
+.editor-left {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+
+.file-meta {
+  min-width: 0;
+}
+
+.file-name {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text-main);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.file-path {
+  margin-top: 4px;
+  font-size: 0.75rem;
+  color: var(--text-sub);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.back-btn {
+  background: var(--surface);
+  border: none;
+  color: var(--text-main);
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: 0.2s;
+  flex-shrink: 0;
+}
+
+.back-btn:hover {
+  background: var(--surface-hover);
+}
+
+.editor-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.action-btn {
+  border: none;
+  background: var(--surface);
+  color: var(--text-main);
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: 0.2s;
+  white-space: nowrap;
+}
+
+.action-btn:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+
+.action-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.primary-btn {
+  border: none;
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: 0.2s;
+  white-space: nowrap;
+}
+
+.primary-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.accent-btn {
+  background: var(--text-main);
+  color: var(--accent-fg);
+}
+
+.accent-btn:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
+.mini-btn {
+  padding: 8px 14px;
+}
+
+/* 编辑区 */
+.editor-body {
+  flex: 1;
+  height: calc(100vh - 260px);
+  overflow: hidden;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+}
+
+.editor-body :deep(.cm-editor) {
+  height: calc(100vh - 260px);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.editor-body :deep(.cm-scroller) {
+  overflow: auto;
+}
+
+.editor-body :deep(.cm-content) {
+  min-height: 100%;
+}
+
+/* 底部统计栏：滚到底部后显示 */
+.editor-summary-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: auto;
+  padding-top: 16px;
+  font-size: 0.8rem;
+  color: var(--text-sub);
+  font-family: var(--font-mono);
+}
+
+.remote-warning {
+  background: var(--surface-panel);
+  color: var(--text-main);
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 0.8rem;
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  border: 1px dashed var(--text-muted);
+}
+
+/* 选区 span 级兜底：确保 token 颜色不干扰选中文字 */
+.editor-body :deep(.cm-content span::selection) {
+  background: #000 !important;
+  color: #fff !important;
+}
+
+:root.dark .editor-body :deep(.cm-content span::selection) {
+  background: #fff !important;
+  color: #000 !important;
+}
+</style>

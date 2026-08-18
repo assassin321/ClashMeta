@@ -1,0 +1,181 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  APP_TAG: ""
+  APP_VERSION: ""
+
+permissions:
+  contents: write
+
+jobs:
+  release-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        shell: pwsh
+        run: |
+          $tag = "${env:GITHUB_REF_NAME}"
+          $version = $tag.TrimStart("v")
+
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Invalid release tag: $tag. Expected vX.Y.Z"
+          }
+
+          echo "APP_TAG=$tag" >> $env:GITHUB_ENV
+          echo "APP_VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Install Go
+        uses: actions/setup-go@v4
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Wails CLI
+        shell: pwsh
+        run: |
+          go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+
+      - name: Install Inno Setup and 7-Zip
+        shell: pwsh
+        run: |
+          choco install innosetup 7zip -y
+          echo "C:\Program Files (x86)\Inno Setup 6" >> $env:GITHUB_PATH
+          echo "C:\Program Files\7-Zip" >> $env:GITHUB_PATH
+
+      - name: Patch version files
+        shell: pwsh
+        run: |
+          $version = "${env:APP_VERSION}"
+          ./scripts/set_version.ps1 -Version $version
+
+      - name: Fetch runtime assets
+        shell: pwsh
+        run: |
+          .\scripts\fetch_runtime_assets.ps1
+
+      - name: Build Wails app
+        shell: pwsh
+        run: |
+          wails build -clean -platform windows/amd64
+
+      - name: Build Helper service
+        shell: pwsh
+        run: |
+          go build -ldflags "-s -w" -o build/bin/ClashMetaHelper.exe ./cmd/clashmeta-helper/
+
+      - name: Validate core files
+        shell: pwsh
+        run: |
+          .\scripts\validate_assets.ps1 -AssetRoot .\build\runtime-assets\core\bin
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          ISCC.exe package.iss
+
+      - name: Prepare portable directory
+        shell: pwsh
+        run: |
+          $root = "build/portable/ClashMeta"
+          New-Item -ItemType Directory -Force "$root/seed/core/bin" | Out-Null
+          New-Item -ItemType File -Force "$root/.portable" | Out-Null
+
+          Copy-Item "build/bin/ClashMeta.exe" "$root/ClashMeta.exe" -Force
+          Copy-Item "build/bin/ClashMetaHelper.exe" "$root/ClashMetaHelper.exe" -Force
+          Copy-Item "build/runtime-assets/core/bin/*" "$root/seed/core/bin" -Recurse -Force
+          if (Test-Path "build/runtime-assets/core/asset-manifest.json") {
+            Copy-Item "build/runtime-assets/core/asset-manifest.json" "$root/seed/core/asset-manifest.json" -Force
+          }
+
+      - name: Pack portable zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "build/portable/ClashMeta/*" -DestinationPath "build/ClashMeta_Portable.zip" -Force
+
+      - name: Pack portable 7z
+        shell: pwsh
+        run: |
+          7z a -t7z "build/ClashMeta_Portable.7z" "build/portable/ClashMeta\*" -mx=9
+
+      - name: Move installer
+        shell: pwsh
+        run: |
+          $src = "build/installer/ClashMeta_win_amd64_Setup.exe"
+          $dst = "build/ClashMeta_win_amd64_Setup.exe"
+
+          if (!(Test-Path $src)) {
+            throw "Installer not found: $src"
+          }
+
+          Copy-Item $src $dst -Force
+
+      - name: Generate release notes
+        shell: pwsh
+        run: |
+          $tag = "${env:APP_TAG}"
+
+          if (!(Test-Path "CHANGELOG.md")) {
+            throw "CHANGELOG.md not found"
+          }
+
+          $content = Get-Content "CHANGELOG.md" -Raw
+          $pattern = "(?ms)^##\s+$tag\s*(.*?)(?=^##\s+v|\z)"
+          $match = [regex]::Match($content, $pattern)
+
+          if (!$match.Success) {
+            throw "No changelog section found for $tag"
+          }
+
+          $changes = $match.Groups[1].Value.Trim()
+          if ([string]::IsNullOrWhiteSpace($changes)) {
+            $changes = "1. "
+          }
+
+          $notes = @"
+          # 正式版 $tag
+
+          ClashMeta $tag 登场。
+
+          ## 更新内容
+
+          $tag 更新说明：
+
+          $changes
+
+          ## 安装与运行须知
+          1. 从 Releases 页面下载最新版本的 ClashMeta 安装包。
+          2. 常规模式双击即可运行。TUN 模式需要安装后台服务 (ClashMetaHelper)，可在设置页面一键安装。
+          3. 便携包解压即用，点击主程序即可使用。
+          4. 如果有缺失运行环境，请前往 [Microsoft Edge WebView2 下载页面](https://developer.microsoft.com/en-us/microsoft-edge/webview2?form=MA13LH)
+
+          ClashMeta - 追求极致性能与极简体验。
+          "@
+
+          $notes = $notes -replace "(?m)^[ \t]+", ""
+          Set-Content "build/release_notes.md" $notes -Encoding UTF8
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: ClashMeta ${{ env.APP_TAG }}
+          tag_name: ${{ env.APP_TAG }}
+          body_path: build/release_notes.md
+          files: |
+            build/ClashMeta_win_amd64_Setup.exe
+            build/ClashMeta_Portable.zip
+            build/ClashMeta_Portable.7z

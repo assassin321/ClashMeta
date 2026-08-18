@@ -1,0 +1,262 @@
+//go:build windows
+
+package sys
+
+import (
+	"fmt"
+	"clashmeta/core/logger"
+	"golang.org/x/sys/windows/registry"
+	"runtime"
+	"sync"
+	"syscall"
+	"unsafe"
+)
+
+var (
+	wininet               = syscall.NewLazyDLL("wininet.dll")
+	procInternetSetOption = wininet.NewProc("InternetSetOptionW")
+
+	rasapi32           = syscall.NewLazyDLL("rasapi32.dll")
+	procRasEnumEntries = rasapi32.NewProc("RasEnumEntriesW")
+
+	systemProxyMu sync.Mutex
+)
+
+const (
+	INTERNET_OPTION_PER_CONNECTION_OPTION = 75
+	INTERNET_OPTION_SETTINGS_CHANGED      = 39
+	INTERNET_OPTION_REFRESH               = 37
+
+	PROXY_TYPE_DIRECT = 1
+	PROXY_TYPE_PROXY  = 2
+
+	INTERNET_PER_CONN_FLAGS        = 1
+	INTERNET_PER_CONN_PROXY_SERVER = 2
+	INTERNET_PER_CONN_PROXY_BYPASS = 3
+
+	ERROR_SUCCESS          = 0
+	ERROR_BUFFER_TOO_SMALL = 603
+	RAS_MaxEntryName       = 256
+	MAX_PATH               = 260
+)
+
+// ⚠️ 修复1：使用 uintptr 代替 uint64。
+// 这样在 64 位系统下是 8 字节并自动产生 4 字节 Padding，
+// 在 32 位系统下是 4 字节无 Padding，完美对齐 C++ 中的 union 结构
+type INTERNET_PER_CONN_OPTION struct {
+	dwOption uint32
+	Value    uintptr
+}
+
+type INTERNET_PER_CONN_OPTION_LIST struct {
+	dwSize        uint32
+	pszConnection *uint16
+	dwOptionCount uint32
+	dwOptionError uint32
+	pOptions      *INTERNET_PER_CONN_OPTION
+}
+
+type RasEntryName struct {
+	dwSize      uint32
+	szEntryName [RAS_MaxEntryName + 1]uint16
+	dwFlags     uint32
+	szPhonebook [MAX_PATH + 1]uint16
+}
+
+// EnableSystemProxy 开启系统代理
+func EnableSystemProxy(host string, port int, bypassDomains string) error {
+	systemProxyMu.Lock()
+	defer systemProxyMu.Unlock()
+
+	return enableSystemProxyLocked(host, port, bypassDomains)
+}
+
+// enableSystemProxyLocked 内部实现，调用方必须持有 systemProxyMu
+func enableSystemProxyLocked(host string, port int, bypassDomains string) error {
+	serverStr := fmt.Sprintf("%s:%d", host, port)
+
+	serverPtr, _ := syscall.UTF16PtrFromString(serverStr)
+	bypassPtr, _ := syscall.UTF16PtrFromString(bypassDomains)
+
+	options := []INTERNET_PER_CONN_OPTION{
+		{dwOption: INTERNET_PER_CONN_FLAGS, Value: uintptr(PROXY_TYPE_DIRECT | PROXY_TYPE_PROXY)},
+		{dwOption: INTERNET_PER_CONN_PROXY_SERVER, Value: uintptr(unsafe.Pointer(serverPtr))},
+		{dwOption: INTERNET_PER_CONN_PROXY_BYPASS, Value: uintptr(unsafe.Pointer(bypassPtr))},
+	}
+
+	list := INTERNET_PER_CONN_OPTION_LIST{
+		dwSize:        uint32(unsafe.Sizeof(INTERNET_PER_CONN_OPTION_LIST{})),
+		pszConnection: nil, // LAN
+		dwOptionCount: uint32(len(options)),
+		pOptions:      &options[0],
+	}
+
+	// 1. 设置局域网代理
+	ret, _, err := procInternetSetOption.Call(
+		0,
+		uintptr(INTERNET_OPTION_PER_CONNECTION_OPTION),
+		uintptr(unsafe.Pointer(&list)),
+		uintptr(list.dwSize),
+	)
+	if ret == 0 {
+		return fmt.Errorf("设置默认连接代理失败: %v", err)
+	}
+
+	// 2. 设置 RAS 拨号/VPN 代理
+	setRasProxy(&list)
+
+	// 3. 全局广播，瞬间生效
+	refreshSystemProxyLocked()
+
+	// 标记代理所有权，用于异常崩溃后的精准自愈
+	markSystemProxyOwnedLocked(host, port)
+
+	logger.Infof("系统代理设置成功: %s", serverStr)
+
+	// GC 护城河！必须保持这些变量在 Syscall 执行完毕前不被回收！
+	runtime.KeepAlive(serverPtr)
+	runtime.KeepAlive(bypassPtr)
+	runtime.KeepAlive(options)
+	runtime.KeepAlive(list)
+
+	return nil
+}
+
+// DisableSystemProxy 关闭系统代理
+func DisableSystemProxy() error {
+	systemProxyMu.Lock()
+	defer systemProxyMu.Unlock()
+
+	return disableSystemProxyLocked()
+}
+
+// disableSystemProxyLocked 内部实现，调用方必须持有 systemProxyMu
+func disableSystemProxyLocked() error {
+	options := []INTERNET_PER_CONN_OPTION{
+		{dwOption: INTERNET_PER_CONN_FLAGS, Value: uintptr(PROXY_TYPE_DIRECT)},
+	}
+
+	list := INTERNET_PER_CONN_OPTION_LIST{
+		dwSize:        uint32(unsafe.Sizeof(INTERNET_PER_CONN_OPTION_LIST{})),
+		pszConnection: nil,
+		dwOptionCount: uint32(len(options)),
+		pOptions:      &options[0],
+	}
+
+	ret, _, err := procInternetSetOption.Call(
+		0,
+		uintptr(INTERNET_OPTION_PER_CONNECTION_OPTION),
+		uintptr(unsafe.Pointer(&list)),
+		uintptr(list.dwSize),
+	)
+	if ret == 0 {
+		return fmt.Errorf("关闭代理选项失败: %v", err)
+	}
+
+	setRasProxy(&list)
+
+	refreshSystemProxyLocked()
+
+	// 清理代理所有权标记
+	unmarkSystemProxyOwnedLocked()
+
+	logger.Infof("系统代理已禁用")
+
+	// 保护指针
+	runtime.KeepAlive(options)
+	runtime.KeepAlive(list)
+
+	return nil
+}
+
+// RefreshSystemProxy 向整个 Windows 系统广播代理状态变更
+// 通知 Chrome/Edge/IE 等浏览器立即拉取最新注册表设置
+func RefreshSystemProxy() {
+	systemProxyMu.Lock()
+	defer systemProxyMu.Unlock()
+
+	refreshSystemProxyLocked()
+}
+
+// refreshSystemProxyLocked 内部实现，调用方必须持有 systemProxyMu
+func refreshSystemProxyLocked() {
+	// 39 = INTERNET_OPTION_SETTINGS_CHANGED
+	// 37 = INTERNET_OPTION_REFRESH
+	procInternetSetOption.Call(0, uintptr(INTERNET_OPTION_SETTINGS_CHANGED), 0, 0)
+	procInternetSetOption.Call(0, uintptr(INTERNET_OPTION_REFRESH), 0, 0)
+}
+
+func setRasProxy(list *INTERNET_PER_CONN_OPTION_LIST) {
+	var cb uint32 = uint32(unsafe.Sizeof(RasEntryName{}))
+	var cEntries uint32 = 0
+
+	entry := RasEntryName{dwSize: cb}
+
+	ret, _, _ := procRasEnumEntries.Call(
+		0, 0,
+		uintptr(unsafe.Pointer(&entry)),
+		uintptr(unsafe.Pointer(&cb)),
+		uintptr(unsafe.Pointer(&cEntries)),
+	)
+
+	if ret == ERROR_BUFFER_TOO_SMALL && cEntries > 0 {
+		entries := make([]RasEntryName, cEntries)
+		entries[0].dwSize = uint32(unsafe.Sizeof(RasEntryName{}))
+
+		ret, _, _ = procRasEnumEntries.Call(
+			0, 0,
+			uintptr(unsafe.Pointer(&entries[0])),
+			uintptr(unsafe.Pointer(&cb)),
+			uintptr(unsafe.Pointer(&cEntries)),
+		)
+
+		if ret == ERROR_SUCCESS {
+			for i := uint32(0); i < cEntries; i++ {
+				list.pszConnection = &entries[i].szEntryName[0]
+
+				procInternetSetOption.Call(
+					0,
+					uintptr(INTERNET_OPTION_PER_CONNECTION_OPTION),
+					uintptr(unsafe.Pointer(list)),
+					uintptr(list.dwSize),
+				)
+			}
+		}
+		// 保护 entries 切片不被回收
+		runtime.KeepAlive(entries)
+	}
+}
+
+// SystemProxyState 表示系统代理的当前状态
+type SystemProxyState struct {
+	Enabled bool
+	Server  string
+}
+
+// GetSystemProxyState 从注册表读取当前的系统代理配置
+func GetSystemProxyState() (SystemProxyState, error) {
+	key, err := registry.OpenKey(
+		registry.CURRENT_USER,
+		`Software\Microsoft\Windows\CurrentVersion\Internet Settings`,
+		registry.QUERY_VALUE,
+	)
+	if err != nil {
+		return SystemProxyState{}, err
+	}
+	defer key.Close()
+
+	enabled, _, err := key.GetIntegerValue("ProxyEnable")
+	if err != nil {
+		return SystemProxyState{}, err
+	}
+
+	proxyServer, _, err := key.GetStringValue("ProxyServer")
+	if err != nil {
+		proxyServer = ""
+	}
+
+	return SystemProxyState{
+		Enabled: enabled != 0,
+		Server:  proxyServer,
+	}, nil
+}
