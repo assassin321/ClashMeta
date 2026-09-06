@@ -1,0 +1,724 @@
+//go:build windows
+
+package backup
+
+import (
+	"archive/zip"
+	"context"
+	"encoding/json"
+	"fmt"
+	"clashmeta/core/clash"
+	"clashmeta/core/utils"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+// Manifest 备份包元数据
+type Manifest struct {
+	App           string   `json:"app"`
+	BackupVersion int      `json:"backupVersion"`
+	AppVersion    string   `json:"appVersion"`
+	CreatedAt     int64    `json:"createdAt"`
+	Contains      []string `json:"contains"`
+}
+
+const CurrentBackupVersion = 2
+
+// Export 打包数据到指定的目标路径，使用 staging 临时快照方式
+func Export(dataDir, destPath string, appVersion string) error {
+	// 1. 创建临时目录进行快照
+	stagingDir, err := os.MkdirTemp(filepath.Dir(dataDir), ".clashmeta-export-*")
+	if err != nil {
+		return fmt.Errorf("创建临时导出目录失败: %v", err)
+	}
+	defer os.RemoveAll(stagingDir)
+
+	targets := []string{
+		"Settings",
+		"Subscriptions",
+		"profiles",
+		"config.yaml",
+		"theme_setting.txt",
+	}
+
+	contains := []string{}
+
+	// 2. 复制目标文件到 staging
+	for _, target := range targets {
+		src := filepath.Join(dataDir, target)
+		dst := filepath.Join(stagingDir, target)
+
+		info, err := os.Stat(src)
+		if err != nil {
+			continue
+		}
+
+		if target == "profiles" {
+			// 🛡️ 针对索引文件夹，持有极短时间的读锁进行快照，防止 index.json 损坏
+			clash.IndexLock.RLock()
+			err = copyDir(src, dst)
+			clash.IndexLock.RUnlock()
+		} else if info.IsDir() {
+			err = copyDir(src, dst)
+		} else {
+			err = copyFile(src, dst)
+		}
+
+		if err == nil {
+			contains = append(contains, strings.ToLower(target))
+		}
+	}
+
+	// 3. 生成 manifest.json
+	manifest := Manifest{
+		App:           "ClashMeta",
+		BackupVersion: CurrentBackupVersion,
+		AppVersion:    appVersion,
+		CreatedAt:     time.Now().Unix(),
+		Contains:      contains,
+	}
+	mBytes, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return fmt.Errorf("生成备份 manifest 失败: %w", err)
+	}
+	if err := utils.WriteFileAtomic(filepath.Join(stagingDir, "manifest.json"), mBytes, 0644); err != nil {
+		return fmt.Errorf("写入备份 manifest 失败: %w", err)
+	}
+
+	// 4. 执行压缩打包
+	f, err := os.Create(destPath)
+	if err != nil {
+		return fmt.Errorf("创建备份文件失败: %v", err)
+	}
+	defer f.Close()
+
+	zw := zip.NewWriter(f)
+	defer zw.Close()
+
+	return filepath.Walk(stagingDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		relPath, _ := filepath.Rel(stagingDir, path)
+		w, err := zw.Create(filepath.ToSlash(relPath))
+		if err != nil {
+			return err
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		_, err = w.Write(content)
+		return err
+	})
+}
+
+// BackupStagingResult 解压到 staging 后的结果
+type BackupStagingResult struct {
+	Index    []clash.SubIndexItem
+	HasIndex bool
+	IndexErr error
+}
+
+// RestoreTransactional 事务化恢复流程
+func RestoreTransactional(ctx context.Context, dataDir, archivePath, mode string) error {
+	// 1. 模式校验
+	if err := validateRestoreMode(mode); err != nil {
+		return err
+	}
+
+	// 2. 创建工作空间 (staging 为待恢复数据，rollback 为旧数据备份)
+	workDir, err := os.MkdirTemp(filepath.Dir(dataDir), ".clashmeta-restore-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(workDir)
+
+	stagingDir := filepath.Join(workDir, "staging")
+	rollbackDir := filepath.Join(workDir, "rollback")
+	os.MkdirAll(stagingDir, 0755)
+	os.MkdirAll(rollbackDir, 0755)
+
+	// 3. 解压并归一化到 staging (Zip Bomb 防护在内部执行)
+	stagingResult, err := extractAndNormalizeToStaging(archivePath, stagingDir)
+	if err != nil {
+		return err
+	}
+
+	// 🛡️ 核心修复：针对替换式恢复，必须确保备份包内包含有效的索引文件
+	if mode == "all" || mode == "subs" {
+		if !stagingResult.HasIndex {
+			rebuilt, err := rebuildIndexFromSubscriptions(stagingDir)
+			if err != nil {
+				return fmt.Errorf("备份缺少 profiles/index.json，且无法从 Subscriptions 重建索引: %w", err)
+			}
+			stagingResult.Index = rebuilt
+			stagingResult.HasIndex = true
+		}
+
+		if stagingResult.IndexErr != nil {
+			return fmt.Errorf("备份订阅索引解析失败: %v", stagingResult.IndexErr)
+		}
+	}
+
+	// 4. 校验 manifest (针对非 ClashMeta 备份进行拦截)
+	if err := validateManifest(stagingDir); err != nil {
+		return err
+	}
+
+	// 5. 构建恢复计划
+	plan := buildRestorePlan(mode)
+
+	// 🛡️ 核心修复：校验备份包是否包含模式所需的目标，防止静默成功
+	if err := validateRestorePlanInputs(stagingDir, plan, mode); err != nil {
+		return err
+	}
+
+	// 6. 备份当前受影响的目标到 rollback 目录，用于失败回滚
+	if err := backupCurrentTargets(dataDir, plan, rollbackDir); err != nil {
+		return fmt.Errorf("备份当前数据失败，取消恢复: %v", err)
+	}
+
+	if mode == "subs-merge" && len(stagingResult.Index) == 0 {
+		rebuilt, err := rebuildIndexFromSubscriptions(stagingDir)
+		if err == nil {
+			stagingResult.Index = rebuilt
+		}
+	}
+
+	// 7. 执行原子替换逻辑
+	if err := applyRestorePlan(dataDir, stagingDir, plan, mode, stagingResult.Index); err != nil {
+		// 8. 执行失败，尝试从 rollback 目录恢复
+		_ = rollbackRestorePlan(dataDir, rollbackDir, plan)
+		return fmt.Errorf("恢复执行失败，已尝试自动回滚: %v", err)
+	}
+
+	return nil
+}
+
+type RestorePlan struct {
+	ReplaceDirs  []string
+	ReplaceFiles []string
+	MergeDirs    []string
+}
+
+func buildRestorePlan(mode string) *RestorePlan {
+	plan := &RestorePlan{}
+	switch mode {
+	case "all":
+		plan.ReplaceDirs = []string{"Settings", "Subscriptions", "profiles"}
+		plan.ReplaceFiles = []string{"config.yaml", "theme_setting.txt"}
+	case "settings":
+		plan.ReplaceDirs = []string{"Settings"}
+		plan.ReplaceFiles = []string{"theme_setting.txt"}
+	case "subs":
+		plan.ReplaceDirs = []string{"Subscriptions", "profiles"}
+		plan.ReplaceFiles = []string{"config.yaml"}
+	case "subs-merge":
+		plan.MergeDirs = []string{"Subscriptions"}
+	}
+	return plan
+}
+
+func validateRestorePlanInputs(stagingDir string, plan *RestorePlan, mode string) error {
+	required := append([]string{}, plan.ReplaceDirs...)
+	required = append(required, plan.ReplaceFiles...)
+
+	// 可选项可以排除 theme_setting.txt，兼容旧备份
+	optional := map[string]bool{
+		"theme_setting.txt": true,
+	}
+
+	for _, target := range required {
+		if optional[target] {
+			continue
+		}
+
+		if _, err := os.Stat(filepath.Join(stagingDir, target)); err != nil {
+			return fmt.Errorf("备份包缺少恢复模式 %s 所需目标: %s", mode, target)
+		}
+	}
+
+	return nil
+}
+
+func applyRestorePlan(dataDir, stagingDir string, plan *RestorePlan, mode string, backupIndex []clash.SubIndexItem) error {
+	// A. 替换式目录：先删再考
+	for _, dir := range plan.ReplaceDirs {
+		src := filepath.Join(stagingDir, dir)
+		dst := filepath.Join(dataDir, dir)
+		if _, err := os.Stat(src); err == nil {
+			_ = os.RemoveAll(dst)
+			if err := copyDir(src, dst); err != nil {
+				return err
+			}
+		}
+	}
+
+	// B. 替换式文件：直接覆盖
+	for _, file := range plan.ReplaceFiles {
+		src := filepath.Join(stagingDir, file)
+		dst := filepath.Join(dataDir, file)
+		if _, err := os.Stat(src); err == nil {
+			if err := copyFile(src, dst); err != nil {
+				return err
+			}
+		}
+	}
+
+	// C. 合并式目录：仅 Subscriptions 目录在 subs-merge 模式下执行增量复制
+	if mode == "subs-merge" {
+		src := filepath.Join(stagingDir, "Subscriptions")
+		dst := filepath.Join(dataDir, "Subscriptions")
+		if _, err := os.Stat(src); err == nil {
+			if err := copyDir(src, dst); err != nil {
+				return err
+			}
+		}
+	}
+
+	// D. 索引状态恢复：单独处理内存索引，防止与磁盘状态不一致
+	switch mode {
+	case "all", "subs":
+		// 替换语义：丢弃本地，全量使用备份
+		return clash.ReplaceSubIndex(backupIndex)
+	case "subs-merge":
+		// 合并语义：将备份索引项合并进本地
+		return mergeBackupIndex(backupIndex)
+	}
+
+	return nil
+}
+
+func backupCurrentTargets(dataDir string, plan *RestorePlan, rollbackDir string) error {
+	allTargets := append([]string{}, plan.ReplaceDirs...)
+	allTargets = append(allTargets, plan.ReplaceFiles...)
+	allTargets = append(allTargets, plan.MergeDirs...)
+
+	for _, target := range allTargets {
+		src := filepath.Join(dataDir, target)
+		dst := filepath.Join(rollbackDir, target)
+
+		info, err := os.Stat(src)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("读取当前目标失败 %s: %w", target, err)
+		}
+
+		if info.IsDir() {
+			if err := copyDir(src, dst); err != nil {
+				return fmt.Errorf("备份目录失败 %s: %w", target, err)
+			}
+		} else {
+			if err := copyFile(src, dst); err != nil {
+				return fmt.Errorf("备份文件失败 %s: %w", target, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func rollbackRestorePlan(dataDir, rollbackDir string, plan *RestorePlan) error {
+	allTargets := append([]string{}, plan.ReplaceDirs...)
+	allTargets = append(allTargets, plan.ReplaceFiles...)
+	allTargets = append(allTargets, plan.MergeDirs...)
+
+	for _, target := range allTargets {
+		src := filepath.Join(rollbackDir, target)
+		dst := filepath.Join(dataDir, target)
+
+		// 🛡️ 核心修复：无论旧目标是否存在，都先删除恢复过程中产生的新目标（防止残留数据污染）
+		_ = os.RemoveAll(dst)
+
+		if _, err := os.Stat(src); err == nil {
+			info, _ := os.Stat(src)
+			if info.IsDir() {
+				_ = copyDir(src, dst)
+			} else {
+				_ = copyFile(src, dst)
+			}
+		}
+	}
+	return nil
+}
+
+func validateRestoreMode(mode string) error {
+	switch mode {
+	case "all", "settings", "subs", "subs-merge":
+		return nil
+	default:
+		return fmt.Errorf("不支持的恢复模式: %s", mode)
+	}
+}
+
+func validateManifest(stagingDir string) error {
+	path := filepath.Join(stagingDir, "manifest.json")
+
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		// 兼容旧版备份：旧备份没有 manifest.json
+		return nil
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("读取备份 manifest 失败: %w", err)
+	}
+
+	var manifest Manifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return fmt.Errorf("备份 manifest 格式损坏: %w", err)
+	}
+
+	if strings.TrimSpace(manifest.App) != "ClashMeta" {
+		return fmt.Errorf("备份文件校验失败: 归属应用不匹配 (%s)", manifest.App)
+	}
+
+	if manifest.BackupVersion <= 0 {
+		return fmt.Errorf("备份 manifest 缺少有效 backupVersion")
+	}
+
+	if manifest.BackupVersion > CurrentBackupVersion {
+		return fmt.Errorf(
+			"备份版本过高，当前程序不支持: backupVersion=%d, supported=%d",
+			manifest.BackupVersion,
+			CurrentBackupVersion,
+		)
+	}
+
+	return nil
+}
+
+func extractAndNormalizeToStaging(archivePath, stagingDir string) (*BackupStagingResult, error) {
+	zr, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+
+	result := &BackupStagingResult{}
+
+	const (
+		maxRestoreFiles  = 1000
+		maxRestoreTotal  = 300 * 1024 * 1024
+		maxRestoreSingle = 50 * 1024 * 1024
+	)
+
+	if len(zr.File) > maxRestoreFiles {
+		return nil, fmt.Errorf("备份包内文件过多")
+	}
+
+	var totalUncompressed uint64
+
+	for _, f := range zr.File {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+
+		destRel, _, ok := normalizeBackupEntry(f.Name)
+		if !ok {
+			continue
+		}
+
+		if f.UncompressedSize64 > maxRestoreSingle {
+			return nil, fmt.Errorf("文件过大: %s", f.Name)
+		}
+		totalUncompressed += f.UncompressedSize64
+		if totalUncompressed > maxRestoreTotal {
+			return nil, fmt.Errorf("备份包总体积超出限制")
+		}
+
+		// 提前解析索引文件
+		if destRel == "profiles/index.json" {
+			result.HasIndex = true
+			rc, err := f.Open()
+			if err == nil {
+				result.IndexErr = json.NewDecoder(rc).Decode(&result.Index)
+				rc.Close()
+			} else {
+				result.IndexErr = err
+			}
+		}
+
+		destPath, err := safeJoinUnder(stagingDir, destRel)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+			return nil, err
+		}
+
+		rc, err := f.Open()
+		if err != nil {
+			return nil, err
+		}
+		dstFile, err := os.OpenFile(destPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+		if err != nil {
+			rc.Close()
+			return nil, err
+		}
+		_, err = io.Copy(dstFile, rc)
+		closeErr1 := dstFile.Close()
+		closeErr2 := rc.Close()
+		if err != nil {
+			return nil, err
+		}
+		if closeErr1 != nil {
+			return nil, closeErr1
+		}
+		if closeErr2 != nil {
+			return nil, closeErr2
+		}
+	}
+	return result, nil
+}
+
+// --- Utils ---
+
+func copyFile(src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer sourceFile.Close()
+	destFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer destFile.Close()
+	_, err = io.Copy(destFile, sourceFile)
+	return err
+}
+
+func copyDir(src, dst string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dst, info.Mode()); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		srcPath := filepath.Join(src, entry.Name())
+		dstPath := filepath.Join(dst, entry.Name())
+		if entry.IsDir() {
+			if err := copyDir(srcPath, dstPath); err != nil {
+				return err
+			}
+		} else {
+			if err := copyFile(srcPath, dstPath); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func normalizeBackupEntry(name string) (destRel string, kind string, ok bool) {
+	n := filepath.ToSlash(filepath.Clean(name))
+	lower := strings.ToLower(n)
+	switch {
+	case lower == "theme_setting.txt":
+		return "theme_setting.txt", "theme", true
+	case lower == "config.yaml":
+		return "config.yaml", "config", true
+	case lower == "manifest.json":
+		return "manifest.json", "manifest", true
+	case lower == "behavior.json":
+		return filepath.ToSlash(filepath.Join("Settings", "user_behavior.json")), "settings", true
+	case lower == "dns.json":
+		return filepath.ToSlash(filepath.Join("Settings", "user_dns.json")), "settings", true
+	case lower == "network.json":
+		return filepath.ToSlash(filepath.Join("Settings", "user_network.json")), "settings", true
+	case lower == "tun.json":
+		return filepath.ToSlash(filepath.Join("Settings", "user_tun.json")), "settings", true
+	case lower == "desired_state.json", lower == "user_desired_state.json", lower == "user_user_desired_state.json":
+		return filepath.ToSlash(filepath.Join("Settings", "user_desired_state.json")), "settings", true
+	case strings.HasPrefix(lower, "settings/"):
+		parts := strings.Split(n, "/")
+		rest := strings.Join(parts[1:], "/")
+		rest, ok := cleanBackupRest(rest)
+		if !ok {
+			return "", "", false
+		}
+		switch strings.ToLower(rest) {
+		case "behavior.json":
+			rest = "user_behavior.json"
+		case "dns.json":
+			rest = "user_dns.json"
+		case "network.json":
+			rest = "user_network.json"
+		case "tun.json":
+			rest = "user_tun.json"
+		case "desired_state.json", "user_user_desired_state.json":
+			rest = "user_desired_state.json"
+		}
+		return filepath.ToSlash(filepath.Join("Settings", rest)), "settings", true
+	case strings.HasPrefix(lower, "subscriptions/"):
+		parts := strings.Split(n, "/")
+		rest := strings.Join(parts[1:], "/")
+		rest, ok := cleanBackupRest(rest)
+		if !ok {
+			return "", "", false
+		}
+		return filepath.ToSlash(filepath.Join("Subscriptions", rest)), "subs", true
+	case strings.HasPrefix(lower, "profiles/"):
+		parts := strings.Split(n, "/")
+		rest := strings.Join(parts[1:], "/")
+		rest, ok := cleanBackupRest(rest)
+		if !ok {
+			return "", "", false
+		}
+		return filepath.ToSlash(filepath.Join("profiles", rest)), "profiles", true
+	}
+	return "", "", false
+}
+
+func mergeBackupIndex(backupIndex []clash.SubIndexItem) error {
+	if len(backupIndex) == 0 {
+		return nil
+	}
+	if err := clash.LoadIndex(); err != nil {
+		return err
+	}
+
+	return clash.UpdateSubIndex(func(localIndex []clash.SubIndexItem) ([]clash.SubIndexItem, error) {
+		localIndexMap := make(map[string]int)
+		for i, item := range localIndex {
+			localIndexMap[item.ID] = i
+		}
+
+		for _, bItem := range backupIndex {
+			if idx, exists := localIndexMap[bItem.ID]; exists {
+				localIndex[idx] = bItem
+			} else {
+				localIndex = append(localIndex, bItem)
+			}
+		}
+
+		return localIndex, nil
+	})
+}
+
+func safeJoinUnder(base, rel string) (string, error) {
+	rel = filepath.FromSlash(rel)
+
+	if filepath.IsAbs(rel) {
+		return "", fmt.Errorf("拒绝绝对路径: %s", rel)
+	}
+
+	clean := filepath.Clean(rel)
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("拒绝路径穿越: %s", rel)
+	}
+
+	baseAbs, err := filepath.Abs(base)
+	if err != nil {
+		return "", err
+	}
+
+	targetAbs, err := filepath.Abs(filepath.Join(baseAbs, clean))
+	if err != nil {
+		return "", err
+	}
+
+	backRel, err := filepath.Rel(baseAbs, targetAbs)
+	if err != nil || backRel == ".." || strings.HasPrefix(backRel, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("目标路径逃逸 staging: %s", rel)
+	}
+
+	return targetAbs, nil
+}
+
+func cleanBackupRest(rest string) (string, bool) {
+	rest = filepath.ToSlash(filepath.Clean(rest))
+	if rest == "." || rest == ".." || strings.HasPrefix(rest, "../") {
+		return "", false
+	}
+	if strings.Contains(rest, "\x00") {
+		return "", false
+	}
+	return rest, true
+}
+
+func uniqueID(base string, seen map[string]bool) string {
+	if !seen[base] {
+		return base
+	}
+
+	for i := 2; ; i++ {
+		id := fmt.Sprintf("%s_%d", base, i)
+		if !seen[id] {
+			return id
+		}
+	}
+}
+
+func rebuildIndexFromSubscriptions(stagingDir string) ([]clash.SubIndexItem, error) {
+	subDir := filepath.Join(stagingDir, "Subscriptions")
+
+	if _, err := os.Stat(subDir); err != nil {
+		return nil, err
+	}
+
+	items := make([]clash.SubIndexItem, 0)
+	seen := make(map[string]bool)
+
+	err := filepath.WalkDir(subDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+
+		if d.IsDir() {
+			return nil
+		}
+
+		name := d.Name()
+		lower := strings.ToLower(name)
+
+		if !strings.HasSuffix(lower, ".yaml") && !strings.HasSuffix(lower, ".yml") {
+			return nil
+		}
+
+		id := strings.TrimSuffix(name, filepath.Ext(name))
+
+		safeID, err := utils.SanitizeFilename(id)
+		if err != nil || safeID != id || id == "" {
+			return nil
+		}
+
+		finalID := uniqueID(id, seen)
+		seen[finalID] = true
+
+		items = append(items, clash.SubIndexItem{
+			ID:   finalID,
+			Name: finalID,
+			Type: "local",
+		})
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	if len(items) == 0 {
+		return nil, fmt.Errorf("备份中未找到可恢复的订阅配置文件")
+	}
+
+	return items, nil
+}

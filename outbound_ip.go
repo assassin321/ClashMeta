@@ -1,0 +1,15 @@
+//go:build windows
+
+package main
+
+import "clashmeta/core/appcore"
+
+type OutboundIPResult = appcore.OutboundIPResult
+
+func (a *App) GetOutboundIP(force bool) (OutboundIPResult, error) {
+	return a.core.GetOutboundIP(force)
+}
+
+func (a *App) GetOutboundIPForRoute(force bool, expectedRoute string) (OutboundIPResult, error) {
+	return a.core.GetOutboundIPForRoute(force, expectedRoute)
+}
