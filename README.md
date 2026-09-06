@@ -109,7 +109,7 @@ wails build
 
 ClashMeta 的稳定运行与高性能表现离不开以下卓越的开源项目支持，特此致谢：
 
-* [ClashMeta](https://github.com/Zzz-IT/ClashMeta) - 基于 Wails 构建的Mihomo (Clash Meta) 桌面控制端
+* [GoclashZ](https://github.com/Zzz-IT/GoclashZ) - 基于 Wails 构建的Mihomo (Clash Meta) 桌面控制端
 * [Mihomo (Clash Meta)](https://github.com/MetaCubeX/mihomo) - 核心网络处理引擎
 * [Wails](https://wails.io/) - 跨平台原生框架体系
 * [go-ole](https://github.com/go-ole/go-ole) - Windows COM/OLE 接口绑定 (Task Scheduler 2.0)
