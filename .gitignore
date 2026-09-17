@@ -1,0 +1,37 @@
+# Wails / Go / Frontend
+build/bin/
+frontend/dist/
+node_modules/
+*.exe
+*.log
+
+# Local data & logs
+/data/*
+!/data/core/
+!/data/core/bin/
+!/data/core/bin/*
+data/core/bin/*.tmp
+data/core/bin/*.db
+data/core/bin/*.zip
+data/core/bin/*.meta.json
+
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build Artifacts
+build/installer/
+build/windows/installer/tmp/
+*.msi
+*.msix
+
+# Temp/Misc
+webfonts/
+scratch/
