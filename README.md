@@ -13,15 +13,6 @@
 
 ClashMeta 诞生于对现代桌面应用过度臃肿的抗拒。本项目摒弃传统的 Electron 架构，利用 Go 语言的系统级并发能力与 Wails 的原生渲染特性，将内存足迹与系统资源占用压缩至物理极限。视觉层面坚持高对比度、黑白实色的极简工业美学，剔除一切无意义的渐变与装饰。它不仅是一个控制界面，更是一套经过严苛加固的网络状态管理系统。
 
-## 界面预览
-
-| 深色模式 (Dark) | 浅色模式 (Light) |
-| :---: | :---: |
-| <img src="docs/assets/控制台-黑.png" width="400" alt="控制台深色模式"> | <img src="docs/assets/控制台-白.png" width="400" alt="控制台浅色模式"> |
-| <img src="docs/assets/代理节点-黑.png" width="400" alt="代理节点深色模式"> | <img src="docs/assets/代理节点-白.png" width="400" alt="代理节点浅色模式"> |
-| <img src="docs/assets/订阅-黑.png" width="400" alt="订阅管理深色模式"> | <img src="docs/assets/订阅-白.png" width="400" alt="订阅管理浅色模式"> |
-<!-- markdownlint-enable MD033 -->
-
 ## 核心功能
 
 ### 网络接管与控制
@@ -146,6 +137,7 @@ wails build
 
 ClashMeta 的稳定运行与高性能表现离不开以下卓越的开源项目支持，特此致谢：
 
+* [ClashMeta](https://github.com/Zzz-IT/ClashMeta) - 基于 Wails 构建的Mihomo (Clash Meta) 桌面控制端
 * [Mihomo (Clash Meta)](https://github.com/MetaCubeX/mihomo) - 核心网络处理引擎
 * [Wails](https://wails.io/) - 跨平台原生框架体系
 * [go-ole](https://github.com/go-ole/go-ole) - Windows COM/OLE 接口绑定 (Task Scheduler 2.0)

@@ -13,15 +13,6 @@ Wails をベースに構築された、高性能かつミニマルなインダ�
 
 ClashMeta は、過度に肥大化した現代のデスクトップアプリケーションへのアンチテーゼとして誕生しました。従来の Electron アーキテクチャを排除し、Go 言語のシステムレベルの並行処理能力と Wails によるネイティブ WebView レンダリングを最大限に活用することで、メモリ使用量とシステムリソースの消費を極限まで削減しています。視覚面では高コントラストのモノトーン・インダストリアル美学を追求し、不要なグラデーションや装飾を完全に削ぎ落としました。
 
-## プレビュー
-
-| ダークモード (Dark) | ライトモード (Light) |
-| :---: | :---: |
-| <img src="docs/assets/控制台-黑.png" width="400" alt="ダッシュボード Dark"> | <img src="docs/assets/控制台-白.png" width="400" alt="ダッシュボード Light"> |
-| <img src="docs/assets/代理节点-黑.png" width="400" alt="プロキシ Dark"> | <img src="docs/assets/代理节点-白.png" width="400" alt="プロキシ Light"> |
-| <img src="docs/assets/订阅-黑.png" width="400" alt="プロファイル Dark"> | <img src="docs/assets/订阅-白.png" width="400" alt="プロファイル Light"> |
-<!-- markdownlint-enable MD033 -->
-
 ## 主な機能
 
 ### ネットワーク制御と透過プロキシ

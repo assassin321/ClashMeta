@@ -13,15 +13,6 @@
 
 ClashMeta 誕生於對現代桌面應用程式過度臃腫的反思。本專案捨棄傳統 Electron 架構，運用 Go 語言的系統級並行處理能力與 Wails 的原生網頁檢視渲染，將記憶體佔用與系統資源消耗壓縮至極限。視覺風格堅持高對比度、黑白實色的極簡工業美學，剔除多餘的漸層與裝飾。它不只是一個控制介面，更是一套經過嚴謹加固的網路狀態管理平台。
 
-## 介面預覽
-
-| 深色模式 (Dark) | 淺色模式 (Light) |
-| :---: | :---: |
-| <img src="docs/assets/控制台-黑.png" width="400" alt="控制台深色模式"> | <img src="docs/assets/控制台-白.png" width="400" alt="控制台淺色模式"> |
-| <img src="docs/assets/代理节点-黑.png" width="400" alt="代理節點深色模式"> | <img src="docs/assets/代理节点-白.png" width="400" alt="代理節點淺色模式"> |
-| <img src="docs/assets/订阅-黑.png" width="400" alt="訂閱管理深色模式"> | <img src="docs/assets/订阅-白.png" width="400" alt="訂閱管理淺色模式"> |
-<!-- markdownlint-enable MD033 -->
-
 ## 核心功能
 
 ### 網路接管與控制
