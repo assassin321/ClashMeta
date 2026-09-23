@@ -13,15 +13,6 @@ A high-performance, industrial solid-aesthetic Mihomo (Clash Meta) desktop clien
 
 ClashMeta was created out of resistance against the excessive bloat of modern desktop applications. Rejecting the traditional Electron architecture, it leverages Go's system-level concurrency and Wails' native webview rendering to compress memory footprint and system resource overhead to physical limits. Visually, it insists on high-contrast, black-and-white minimalist industrial aesthetics, stripping away all unnecessary gradients and ornaments. It is not merely a control panel, but a rigorously hardened network state management platform.
 
-## Preview
-
-| Dark Mode | Light Mode |
-| :---: | :---: |
-| <img src="docs/assets/控制台-黑.png" width="400" alt="Dashboard Dark"> | <img src="docs/assets/控制台-白.png" width="400" alt="Dashboard Light"> |
-| <img src="docs/assets/代理节点-黑.png" width="400" alt="Proxies Dark"> | <img src="docs/assets/代理节点-白.png" width="400" alt="Proxies Light"> |
-| <img src="docs/assets/订阅-黑.png" width="400" alt="Profiles Dark"> | <img src="docs/assets/订阅-白.png" width="400" alt="Profiles Light"> |
-<!-- markdownlint-enable MD033 -->
-
 ## Key Features
 
 ### Network Interception & Control
