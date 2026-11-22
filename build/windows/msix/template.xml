@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<MsixPackagingToolTemplate
+    xmlns="http://schemas.microsoft.com/msix/packaging/msixpackagingtool/template/2022">
+    <Settings
+        AllowTelemetry="false"
+        ApplyACLsToPackageFiles="true"
+        GenerateCommandLineFile="true"
+        AllowPromptForPassword="false">
+    </Settings>
+    <Installer
+        Path="clashmeta.exe"
+        Arguments=""
+        InstallLocation="C:\Program Files\assassin321\ClashMeta">
+    </Installer>
+    <PackageInformation
+        PackageName="ClashMeta"
+        PackageDisplayName="ClashMeta"
+        PublisherName="CN=assassin321"
+        PublisherDisplayName="assassin321"
+        Version="1.4.0.0"
+        PackageDescription="A modern Clash client">
+        <Capabilities>
+            <Capability Name="runFullTrust" />
+            
+        </Capabilities>
+        <Applications>
+            <Application
+                Id="com.assassin321.clashmeta"
+                Description="A modern Clash client"
+                DisplayName="ClashMeta"
+                ExecutableName="clashmeta.exe"
+                EntryPoint="Windows.FullTrustApplication">
+                
+            </Application>
+        </Applications>
+        <Resources>
+            <Resource Language="en-us" />
+        </Resources>
+        <Dependencies>
+            <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.19041.0" />
+        </Dependencies>
+        <Properties>
+            <Framework>false</Framework>
+            <DisplayName>ClashMeta</DisplayName>
+            <PublisherDisplayName>assassin321</PublisherDisplayName>
+            <Description>A modern Clash client</Description>
+            <Logo>Assets\AppIcon.png</Logo>
+        </Properties>
+    </PackageInformation>
+    <SaveLocation PackagePath="clashmeta.msix" />
+    <PackageIntegrity>
+        <CertificatePath></CertificatePath>
+    </PackageIntegrity>
+</MsixPackagingToolTemplate>

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Name=ClashMeta
+Comment=A modern Clash client
+# The Exec line includes %u to pass the URL to the application
+Exec=/usr/local/bin/clashmeta.exe %u
+Terminal=false
+Type=Application
+Icon=clashmeta.exe
+Categories=Utility;
+StartupWMClass=clashmeta.exe
+
+ 

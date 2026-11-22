@@ -1,0 +1,261 @@
+<template>
+  <div class="settings-page ui-page-shell">
+    <div class="sub-header ui-page-header">
+      <button class="back-btn" @click="$emit('navigate', 'main')">
+        <span class="icon back-icon-svg" v-html="ICONS.arrowLeft"></span>
+      </button>
+      <h3>{{ t('settings.uwp.title') }}</h3>
+    </div>
+
+    <!-- 非管理员权限提示卡片 -->
+    <div v-if="!globalState.isAdmin" class="glass-card setting-group ui-surface-group">
+      <div class="setting-item" id="set-uwp-adminPromptTitle">
+        <div class="info">
+          <h4>{{ t('settings.uwp.adminPromptTitle') }}</h4>
+          <p>{{ t('settings.uwp.notAdminBanner') }}</p>
+        </div>
+        <button class="action-btn" @click="handleRestartAdmin">{{ t('settings.uwp.restartAsAdmin') }}</button>
+      </div>
+    </div>
+
+    <div class="uwp-toolbar">
+      <div class="uwp-search">
+        <span class="search-icon" v-html="ICONS.search"></span>
+        <input v-model="uwpSearch" :placeholder="t('settings.uwp.searchPlaceholder')" />
+        <span v-if="uwpSearch" class="clear-icon" @click="uwpSearch = ''" v-html="ICONS.close"></span>
+      </div>
+      <!-- G-03：第二个按钮的实际动作是「全部置为不豁免」。文案键沿用 settings.uwp.invertSelect
+           （Wave 2 把 8 个语言包里它的文案从"反选 / Invert"改成"全部不选 / Select None"），
+           这里不新增 key，免得 check-i18n 先变红。 -->
+      <div class="uwp-batch">
+        <button class="batch-btn" @click="toggleAllUwp(true)">{{ t('settings.uwp.selectAll') }}</button>
+        <button class="batch-btn" @click="toggleAllUwp(false)">{{ t('settings.uwp.invertSelect') }}</button>
+      </div>
+    </div>
+
+    <div class="uwp-list-wrapper scrollable ui-page-body" id="set-uwp-exemptList">
+      <!-- 列表没加载成功时既没有可改的项，也不允许提交，这里给一行提示（复用全局空态样式） -->
+      <div v-if="!uwpLoaded" class="empty-state-block">
+        <div class="empty-state-hint">{{ t('common.empty') }}</div>
+      </div>
+
+      <div
+        v-for="app in filteredUwpApps"
+        :key="app.sid"
+        class="uwp-app-item"
+        :class="{ 'active': app.isEnabled }"
+        @click="app.isEnabled = !app.isEnabled"
+      >
+        <div class="app-main-content">
+          <div class="app-avatar">
+            {{ app.displayName?.[0]?.toUpperCase() || '?' }}
+          </div>
+          <div class="app-details">
+            <span class="app-name">{{ app.displayName || t('settings.uwp.unnamedApp') }}</span>
+            <span class="app-pkg">{{ app.packageFamilyName }}</span>
+          </div>
+        </div>
+
+        <div class="app-status-wrapper">
+          <div class="uwp-status-tag">
+            {{ app.isEnabled ? t('settings.uwp.exempted') : t('settings.uwp.restricted') }}
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="uwp-footer">
+      <button class="apply-btn" id="set-uwp-applyBtn" :disabled="savingUwp || !uwpLoaded" @click="saveUwpChanges">
+        <span v-if="!savingUwp">{{ t('settings.uwp.applyBtn') }}</span>
+        <span v-else class="loading-spinner">{{ t('settings.uwp.saving') }}</span>
+      </button>
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { computed, onMounted, ref, watch } from 'vue';
+import { App } from '../api';
+import { globalState, showAlert, showConfirm, showToast } from '../store';
+import { displayErrorMessage, toUserError } from '../utils/errors';
+import { ICONS } from '../utils/icons';
+import { t } from '../locales';
+
+const props = defineProps<{ entry: number }>();
+
+defineEmits<{
+  navigate: [view: 'main'];
+}>();
+
+const uwpApps = ref<any[]>([]);
+const uwpSearch = ref('');
+const savingUwp = ref(false);
+// 列表是否成功加载过：false 时禁止提交，避免「空列表 = 用户取消了全部」的误判
+const uwpLoaded = ref(false);
+// 加载成功那一刻的 isEnabled 快照：保存时据此算出真正的 added / removed
+const initialEnabled = ref<Record<string, boolean>>({});
+
+const handleRestartAdmin = async () => {
+  try {
+    await App.RestartAsAdmin();
+  } catch (e: any) {
+    const u = toUserError(e);
+    await showAlert(displayErrorMessage(e), t('common.error'), true, u.detail);
+  }
+};
+
+const enterUwpManager = async () => {
+  try {
+    // bindings 中 GetUwpApps() 返回 UwpApp[] | null，取不到时按空列表处理（保持 v2 行为）
+    const list = (await App.GetUwpApps()) ?? [];
+    uwpApps.value = list;
+
+    const snapshot: Record<string, boolean> = {};
+    for (const app of list) snapshot[app.sid] = !!app.isEnabled;
+    initialEnabled.value = snapshot;
+
+    uwpLoaded.value = true;
+  } catch (e) {
+    // 加载失败保持 false：按钮继续禁用，避免把「没拿到列表」当成「用户取消了全部」
+    uwpLoaded.value = false;
+    const u = toUserError(e);
+    showAlert(t('settings.uwp.fetchFailed', { error: displayErrorMessage(e) }), t('common.error'), true, u.detail);
+  }
+};
+
+watch(() => props.entry, (entry) => {
+  if (entry > 0) {
+    void enterUwpManager();
+  }
+});
+
+onMounted(() => {
+  if (props.entry > 0) {
+    void enterUwpManager();
+  }
+});
+
+const filteredUwpApps = computed(() => {
+  const q = uwpSearch.value.toLowerCase();
+  return uwpApps.value.filter(app =>
+    (app.displayName || '').toLowerCase().includes(q) ||
+    (app.packageFamilyName || '').toLowerCase().includes(q)
+  );
+});
+
+const toggleAllUwp = (val: boolean) => {
+  /* 「全不选」= 全部关闭，不是逐项取反（F-A4-20：原实现会把已关闭的反向打开）。
+     G-18：只改当前过滤后的列表 —— 搜索时列表只显示命中项，若改全集，
+     用户看到的 3 项和实际被改的 200 项对不上，应用后无法核对。 */
+  filteredUwpApps.value.forEach(app => { app.isEnabled = val; });
+};
+
+// 清空确认文案：settings.uwp.clearAllConfirm 已在 8 个语言包中就位（F-A4-17），
+// 不再需要用返回值猜 key 是否存在的回退层。
+const clearAllConfirmText = (): string => t('settings.uwp.clearAllConfirm');
+
+const saveUwpChanges = async () => {
+  // 列表没成功加载时不允许提交（按钮已 disabled，这里兜底）
+  if (!uwpLoaded.value) return;
+
+  if (!globalState.isAdmin) {
+    const ok = await showConfirm(
+      t('settings.uwp.applyConfirmMsg'),
+      t('settings.uwp.applyConfirmTitle'),
+      false
+    );
+    if (!ok) return;
+  }
+
+  const targetSids = uwpApps.value.filter(a => a.isEnabled).map(a => a.sid);
+
+  // 目标为空 = 用户取消了全部勾选：走专门的「清空全部豁免」接口与确认，
+  // 不能把它当普通差异提交，否则和「列表没加载出来」无法区分。
+  if (targetSids.length === 0) {
+    const ok = await showConfirm(clearAllConfirmText(), t('settings.uwp.applyConfirmTitle'), false);
+    if (!ok) return;
+
+    savingUwp.value = true;
+    try {
+      await App.ClearAllUwpExemptions();
+      await enterUwpManager();
+      showToast(t('settings.uwp.saveSuccess'), 'success');
+    } catch (e: any) {
+      const u = toUserError(e);
+      await showAlert(t('settings.uwp.saveFailed', { error: displayErrorMessage(e) }), t('common.error'), true, u.detail);
+    } finally {
+      savingUwp.value = false;
+    }
+    return;
+  }
+
+  // 差异式应用：只提交用户真正勾上 / 取消的 SID，未出现在本次枚举里的系统豁免一律不动
+  const added: string[] = [];
+  const removed: string[] = [];
+  for (const app of uwpApps.value) {
+    const wasEnabled = !!initialEnabled.value[app.sid];
+    const nowEnabled = !!app.isEnabled;
+    if (nowEnabled === wasEnabled) continue;
+    if (nowEnabled) added.push(app.sid);
+    else removed.push(app.sid);
+  }
+
+  savingUwp.value = true;
+  try {
+    await App.ApplyUwpExemptionChanges(added, removed);
+    await enterUwpManager();
+    showToast(t('settings.uwp.saveSuccess'), 'success');
+  } catch (e: any) {
+    const u = toUserError(e);
+    await showAlert(t('settings.uwp.saveFailed', { error: displayErrorMessage(e) }), t('common.error'), true, u.detail);
+  } finally {
+    savingUwp.value = false;
+  }
+};
+</script>
+
+<style scoped>
+.settings-page { flex: 1 1 auto; min-width: 0; }
+h3 { margin: 0 0 8px 0; color: var(--text-main); font-size: 1.25rem; padding-bottom: 4px; }
+.sub-header { display: flex; align-items: center; gap: 16px; margin-bottom: 12px; padding: 0 0 12px 0; background: transparent; }
+.sub-header h3 { margin: 0; border: none; padding: 0; }
+.back-btn { background: var(--surface); border: none; color: var(--text-main); width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: 0.2s; }
+.back-btn:hover { background: var(--ui-surface-hover); }
+.back-btn .icon svg { width: 18px; height: 18px; display: block; }
+.back-icon-svg :deep(svg) { width: 18px; height: 18px; }
+
+.setting-group { padding: 16px 20px; margin-bottom: 16px; border-radius: var(--ui-radius-lg); }
+.setting-item { display: flex; justify-content: space-between; align-items: center; }
+.info { flex: 1; padding-right: 16px; min-width: 0; }
+h4 { margin: 0 0 4px 0; color: var(--text-main); font-size: 0.95rem; }
+p { margin: 0; font-size: 0.85rem; color: var(--text-sub); line-height: 1.5; }
+
+.uwp-toolbar { display: flex; align-items: center; gap: 16px; margin-bottom: 20px; }
+.uwp-search { flex: 1; display: flex; align-items: center; background: var(--surface); border: 1px solid var(--ui-surface-hover); border-radius: var(--ui-radius-md); padding: 0 12px; height: 40px; transition: all 0.2s; }
+.uwp-search:focus-within { border-color: var(--ui-accent); background: var(--ui-surface-card); }
+.uwp-search input { flex: 1; border: none; background: transparent; color: var(--text-main); outline: none; margin-left: 8px; font-size: 0.9rem; }
+.search-icon, .clear-icon { display: flex; align-items: center; color: var(--text-sub); }
+.clear-icon { cursor: pointer; padding: 4px; }
+.uwp-batch { display: flex; gap: 8px; }
+.batch-btn { background: var(--ui-surface-hover); color: var(--text-main); border: none; padding: 8px 16px; border-radius: var(--ui-radius-sm); font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: 0.2s; }
+.batch-btn:hover { background: var(--ui-surface-card); }
+.uwp-list-wrapper { display: flex; flex-direction: column; gap: 10px; flex: 1; padding-right: 4px; }
+.uwp-app-item { background: var(--surface); border-radius: var(--ui-radius-lg); padding: 12px 16px; display: flex; justify-content: space-between; align-items: center; cursor: pointer; transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1); border: 1px solid transparent; }
+.uwp-app-item:hover { background: var(--ui-surface-hover); }
+.uwp-app-item.active { background: var(--ui-accent-block); box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1); }
+.app-main-content { display: flex; align-items: center; gap: 16px; overflow: hidden; flex: 1; }
+.app-avatar { width: 42px; height: 42px; background: var(--ui-surface-card); border-radius: var(--ui-radius-md); display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 1.3rem; color: var(--text-sub); flex-shrink: 0; }
+.uwp-app-item.active .app-avatar { background: rgba(255, 255, 255, 0.15); color: var(--ui-accent-fg); }
+.app-details { display: flex; flex-direction: column; gap: 2px; overflow: hidden; }
+.app-name { font-size: 0.95rem; font-weight: 700; color: var(--text-main); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.uwp-app-item.active .app-name { color: var(--ui-accent-fg); }
+.app-pkg { font-size: 0.75rem; color: var(--text-sub); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: 0.7; }
+.uwp-app-item.active .app-pkg { color: var(--ui-accent-fg); opacity: 0.8; }
+.uwp-status-tag { font-size: 0.7rem; letter-spacing: 0; font-weight: 600; padding: 3px 10px; border-radius: 4px; text-transform: uppercase; transition: all 0.2s; background: var(--ui-surface-card); color: var(--text-main); }
+.uwp-app-item.active .uwp-status-tag { background: var(--ui-accent-fg) !important; color: var(--ui-accent) !important; opacity: 0.8; }
+.uwp-footer { margin-top: 20px; padding-top: 10px; }
+.apply-btn { width: 100%; padding: 14px; background: var(--ui-accent-block); color: var(--ui-accent-fg); border: none; border-radius: var(--ui-radius-lg); font-weight: 700; cursor: pointer; transition: all 0.2s; box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1); }
+.apply-btn:hover:not(:disabled) { filter: brightness(1.1); transform: translateY(-1px); }
+.apply-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.loading-spinner { display: flex; align-items: center; justify-content: center; gap: 8px; }
+</style>
