@@ -53,7 +53,7 @@
     
     
     <key>CFBundleGetInfoString</key>
-    <string>A modern Clash client</string>
+    <string>Clash Meta</string>
     
     <!--
       Privacy usage descriptions. iOS hard-crashes (and the App Store rejects the

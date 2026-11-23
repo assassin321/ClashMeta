@@ -118,7 +118,7 @@ npm run build           exit=0  elapsed=3s
 
 | 产物 | 大小 | 时间 | VERSIONINFO |
 |---|---|---|---|
-| `bin/ClashMeta.exe` | 26,382,336 B（25.16 MB） | 16:33:40 | **FileVersion=1.4.0, ProductVersion=1.4.0, ProductName=ClashMeta, CompanyName=assassin321**, FileDescription=A modern Clash client, Copyright (C) 2026 ✅ |
+| `bin/ClashMeta.exe` | 26,382,336 B（25.16 MB） | 16:33:40 | **FileVersion=1.4.0, ProductVersion=1.4.0, ProductName=ClashMeta, CompanyName=assassin321**, FileDescription=Clash Meta, Copyright (C) 2026 ✅ |
 | `bin/ClashMetaHelper.exe` | 3,464,704 B（3.30 MB） | 16:33:41 | **无 VERSIONINFO**（v2 基线同样无；构建命令与 v2 相同 `go build -ldflags "-s -w"`，见 R-note） |
 | `build/installer/ClashMeta_win_amd64_Setup.exe` | 27,886,716 B（26.59 MB） | 16:34:04 | FileVersion=**1.4.0.0**, ProductVersion=1.4.0, ProductName=ClashMeta, CompanyName=**assassin321** |
 

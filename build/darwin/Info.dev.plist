@@ -12,7 +12,7 @@
         <key>CFBundleVersion</key>
             <string>1.4.0</string>
         <key>CFBundleGetInfoString</key>
-            <string>A modern Clash client</string>
+            <string>Clash Meta</string>
         <key>CFBundleShortVersionString</key>
             <string>1.4.0</string>
         <key>CFBundleIconFile</key>

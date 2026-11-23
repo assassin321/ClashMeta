@@ -8,9 +8,9 @@ info:
   companyName: "assassin321" # The name of the company
   productName: "ClashMeta" # The name of the application
   productIdentifier: "com.assassin321.clashmeta" # The unique product identifier
-  description: "A modern Clash client" # The application description
+  description: "Clash Meta" # The application description
   copyright: "Copyright (C) 2026" # Copyright text
-  comments: "A modern Clash client" # Comments
+  comments: "Clash Meta" # Comments
   version: "1.3.4" # The application version
   # cfBundleIconName: "appicon" # The macOS icon name in Assets.car icon bundles (optional)
   #                               # Should match the name of your .icon file without the extension

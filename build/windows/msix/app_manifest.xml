@@ -16,7 +16,7 @@
   <Properties>
     <DisplayName>ClashMeta</DisplayName>
     <PublisherDisplayName>assassin321</PublisherDisplayName>
-    <Description>A modern Clash client</Description>
+    <Description>Clash Meta</Description>
     <Logo>Assets\StoreLogo.png</Logo>
   </Properties>
   
@@ -32,7 +32,7 @@
     <Application Id="com.assassin321.clashmeta" Executable="clashmeta.exe" EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
         DisplayName="ClashMeta"
-        Description="A modern Clash client"
+        Description="Clash Meta"
         BackgroundColor="transparent"
         Square150x150Logo="Assets\Square150x150Logo.png"
         Square44x44Logo="Assets\Square44x44Logo.png">

@@ -1,7 +1,7 @@
 [Desktop Entry]
 Version=1.0
 Name=ClashMeta
-Comment=A modern Clash client
+Comment=Clash Meta
 # The Exec line includes %u to pass the URL to the application
 Exec=/usr/local/bin/clashmeta.exe %u
 Terminal=false

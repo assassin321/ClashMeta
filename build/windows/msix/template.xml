@@ -18,7 +18,7 @@
         PublisherName="CN=assassin321"
         PublisherDisplayName="assassin321"
         Version="1.4.0.0"
-        PackageDescription="A modern Clash client">
+        PackageDescription="Clash Meta">
         <Capabilities>
             <Capability Name="runFullTrust" />
             
@@ -26,7 +26,7 @@
         <Applications>
             <Application
                 Id="com.assassin321.clashmeta"
-                Description="A modern Clash client"
+                Description="Clash Meta"
                 DisplayName="ClashMeta"
                 ExecutableName="clashmeta.exe"
                 EntryPoint="Windows.FullTrustApplication">
@@ -43,7 +43,7 @@
             <Framework>false</Framework>
             <DisplayName>ClashMeta</DisplayName>
             <PublisherDisplayName>assassin321</PublisherDisplayName>
-            <Description>A modern Clash client</Description>
+            <Description>Clash Meta</Description>
             <Logo>Assets\AppIcon.png</Logo>
         </Properties>
     </PackageInformation>
